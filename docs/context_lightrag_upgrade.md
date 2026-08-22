@@ -96,8 +96,8 @@ RAG_EXTRACTION_CONTEXT_CHARS=24000
 # 普通总结默认不联网补元数据；只有显式询问作者/年份/DOI 时才核验
 RAG_VERIFY_SUMMARY_METADATA_ONLINE=false
 
-# Semantic Scholar 所有端点合计上限为 1 RPS；默认 1.1 秒一次，给边界抖动留余量
-S2_MIN_REQUEST_INTERVAL_SECONDS=1.1
+# Semantic Scholar 所有端点合计上限为 1 RPS；默认 1.5 秒一次，给滑动窗口和网络抖动留余量
+S2_MIN_REQUEST_INTERVAL_SECONDS=1.5
 
 # 仅深度 mix 查询可选启用本机 CrossEncoder；默认 CPU，论文内容不会外传
 LIGHTRAG_LOCAL_RERANK_ENABLED=false
@@ -131,13 +131,13 @@ FastAPI 启动时默认使用 `AsyncSqliteSaver`，checkpoint 写入独立的 `a
 
 PDF 上传后的 DeepDoc 解析和 LightRAG 建图已移出聊天请求链路。`index_jobs.sqlite3` 保存 `queued/parsing/indexing/completed/failed/cancelled` 状态、进度、失败原因和尝试次数；服务重启会把中断任务恢复为 `queued`，失败或取消任务通过 `POST /api/index-jobs/{job_id}/retry` 显式重试。`GET /api/index-jobs` 和 `GET /api/index-jobs/{job_id}` 查询进度，`DELETE` 只允许取消尚未执行的任务。聊天只使用 manifest 中真正完成且物理文件仍存在的论文，上传后未完成时返回明确状态，不再一边聊天一边建图，也不写假成功。
 
-候选论文升级现在由 `EvidenceGateResult` 确定性控制，而不是只看“总结/对比”意图：点名标题必须精确命中；对比至少覆盖两篇不同论文和两个来源；作者、年份、DOI 等按问题要求检查；本地内容性结论必须带真实 `EvidenceSpan`。失败会返回逐项缺口，模型输出 `[APPROVE_SYNTHESIS]` 也不能绕过。Reviewer 接收用户问题、初稿、论文元数据、全部页级 span 和图谱证据组成的只读包，输出结构化 `ReviewResult`；存在 unsupported、unclear 或 citation_error 时驳回，最多隐藏返修一次，仍不通过就降级为可回链证据摘要。前端只流式展示最终通过或安全降级的文本，不提前泄露未审初稿。
+候选论文升级现在由 `EvidenceGateResult` 确定性控制，而不是只看“总结/对比”意图：点名标题必须精确命中；对比至少覆盖两篇不同论文和两个来源；作者、年份、DOI 等按问题要求检查；本地内容性结论必须带真实 `EvidenceSpan`。失败会返回逐项缺口，模型输出 `[APPROVE_SYNTHESIS]` 也不能绕过。Reviewer 接收用户问题、初稿、论文元数据、全部页级 span 和图谱证据组成的只读包，输出结构化 `ReviewResult`；存在 unsupported、unclear 或 citation_error 时驳回，最多隐藏返修一次，仍不通过就降级为可回链证据摘要。Assistant/Synthesizer 的原始生成 token 不再直接对用户可见；最终正文经过 Guard、Reviewer、输出约束并成功落库后，才切块发送 `token` 和唯一 `final`，因此 token 拼接严格等于 final。
 
 “讲一下第一篇”“说一下第二篇”“展开讲”等口语化单篇跟进由代码直接归一为内容解读意图：先按上一轮稳定编号锁定论文，再检查核心字段和真实 `EvidenceSpan`，通过后进入 Synthesizer/Reviewer；不再把检索后的二次决策交给 Assistant 模型。`retrieval_result` 轨迹同时记录 `evidence_span_count`，用于区分“意图未命中”和“页级证据确实缺失”。
 
 长期画像已经闭环到 Assistant 和 Synthesizer，但按“数据而非指令”处理：只适配语言、篇幅、排版和研究兴趣，不能影响检索路由、工具调用、证据标准、引用或用户本轮显式要求；会话级约定仍只作用于当前 session。
 
-SSE 不再全局替换 `sys.stdout/sys.stderr`，而是通过 `ContextVar` 给每个请求绑定独立 `trace_id/session_id/node`，保留原 `log/token/final` 协议。非 token 事件同步脱敏写入 `agent_traces.sqlite3`，包括节点耗时、模型角色、重试/熔断、Tool、检索、证据门和 Reviewer 裁决；prompt、最终正文和 `visible_token` 不入库。`GET /api/traces` 可按 session 查询，`GET /api/traces/{trace_id}` 返回单次轨迹，均按 `X-User-ID` 隔离。该请求头仍只是命名空间，不是完整登录鉴权；当前本地 PDF/LightRAG 仍是共享研究工作区。
+SSE 不再全局替换 `sys.stdout/sys.stderr`，而是通过 `ContextVar` 给每个请求绑定独立 `trace_id/session_id/node`，保留原 `log/token/final` 协议。聊天任务由后台 Task 持有，用户消息在启动任务前写入 SQLite；浏览器刷新或 SSE 断开只停止事件消费，不取消 Agent，后台仍会完成 Reviewer、保存 assistant 正文和关闭 trace。非 token 事件同步脱敏写入 `agent_traces.sqlite3`，包括节点耗时、模型角色、重试/熔断、Tool、检索、证据门和 Reviewer 裁决；prompt、最终正文和 `visible_token` 不入库。`GET /api/traces` 可按 session 查询，`GET /api/traces/{trace_id}` 返回单次轨迹，均按 `X-User-ID` 隔离。该请求头仍只是命名空间，不是完整登录鉴权；当前本地 PDF/LightRAG 仍是共享研究工作区。
 
 联网来源声明同样由代码控制：只有存在与 Assistant tool call 配对的真实 `ToolMessage`，系统才允许确认执行过联网检索；若当前轮复用上一轮网络候选，正文和活动轨迹都会明确标注“本轮未重新联网”。同一问题的轻微错别字重试通过字符相似度保留候选；非跟进新任务会从路由 prompt 中同时移除旧 `assistant.tool_calls` 与对应 `ToolMessage`，防止历史工具结果冒充本轮检索。“查找相关论文”在没有候选时必须实际生成 `trigger_web_search`，直接列举会被确定性拦截。
 
@@ -199,7 +199,7 @@ embedding 模型或维度变化时，必须同时提升 `LIGHTRAG_INDEX_VERSION`
 - 大型“核心情报表”只用于总结、综述、对比和全库清单；单点事实问答仅保留直接答案与证据定位，减少冗余输出和生成延迟。
 - 本地索引同步以 PDF 文件名判断新增和删除，不再用 mtime/size 判断内容变化；代码重新上传后会直接复用已有图谱。
 - “本地有哪些文献/论文清单”走目录快路径，直接读取 manifest 和 full_docs，不执行图查询或结构化证据抽取。其他查询的抽取 schema 只保留六个必要字段并限制摘要长度；若模型仍因输出截断而无法解析，则使用已入库首页和摘要兜底，不再把一次 JSON 截断变成空结果。
-- Semantic Scholar 的所有调用在单进程内共用线程安全限速器，默认请求起始时间至少间隔 1.1 秒；429 重试仍遵循同一节拍，OpenAlex 兜底不占用该额度。多 Uvicorn worker 部署需要 Redis 等跨进程限速器，当前单进程部署无需额外组件。
+- Semantic Scholar 的所有调用在单进程内共用线程安全限速器，默认请求起始时间至少间隔 1.5 秒；429 重试仍遵循同一节拍，OpenAlex 兜底不占用该额度。多 Uvicorn worker 部署需要 Redis 等跨进程限速器，当前单进程部署无需额外组件。
 
 这些调整只改变查询路由、运行时核验和输出收口，不修改 `lightrag_storage` 中的 chunk、向量或图结构，因此不需要重新构建图谱。离线回归结果为 `66 passed, 1 skipped`；8080 端到端指标必须在服务器加载新代码后重新运行，旧 `AGENT_EVAL_REPORT.md` 保留为修复前基线。
 

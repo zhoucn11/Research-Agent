@@ -32,7 +32,7 @@
 
 后端会读取当前会话摘要、长期用户画像，并在 LangGraph checkpoint 为空时注入最近消息作为恢复上下文，随后调用 `agent_app.ainvoke` 进入 LangGraph。Graph 的入口是 Assistant。Assistant 先看用户意图，如果需要本地检索就生成 `trigger_local_retrieval` 工具调用，如果需要联网搜索就生成 `trigger_web_search`，如果已有候选论文并且用户要求“继续整理成综述”，则把候选论文升级为 `selected_papers` 并输出 `[APPROVE_SYNTHESIS]` 进入写作链路。工具节点执行完以后不会直接结束，而是把 ToolMessage 返回给 Assistant，让 Assistant 基于 Observation 再决策。这就是一个简化版 ReAct 循环：Assistant 负责 Thought 和 Action，RAG/Search 节点负责 Observation。
 
-最终结果通过 SSE 一边把日志推给右侧 Runtime Log，一边在结束时推送 final 消息给前端。请求完成后，后端把 user 和 assistant 消息写入 SQLite，同时更新会话摘要和长期用户画像。
+最终结果通过 SSE 一边把日志推给右侧 Runtime Log，一边在结束时推送已审阅 token 和唯一 final。user 消息在后台任务启动前写入 SQLite，assistant 正文在 Guard、Reviewer 和输出约束完成后先落库再发送；浏览器刷新只会断开 SSE，后台任务继续运行并完成会话持久化，同时更新会话摘要和长期用户画像。
 
 ## 四、LangGraph 工作流设计
 

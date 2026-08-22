@@ -15,9 +15,9 @@ _S2_LAST_REQUEST_STARTED_AT = 0.0
 
 def _semantic_scholar_interval_seconds() -> float:
     try:
-        return max(0.0, float(os.environ.get("S2_MIN_REQUEST_INTERVAL_SECONDS", "1.1")))
+        return max(0.0, float(os.environ.get("S2_MIN_REQUEST_INTERVAL_SECONDS", "1.5")))
     except ValueError:
-        return 1.1
+        return 1.5
 
 
 def _wait_for_semantic_scholar_slot() -> None:

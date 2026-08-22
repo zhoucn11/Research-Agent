@@ -1,46 +1,45 @@
-from types import SimpleNamespace
+import asyncio
+from pathlib import Path
 
-from research_agent.api.streaming_utils import message_chunk_text, token_event_from_chunk
-
-
-def test_message_chunk_text_supports_text_blocks():
-    message = SimpleNamespace(
-        content=[
-            {"type": "text", "text": "你"},
-            {"type": "output_text", "text": "好"},
-            {"type": "tool_call_chunk", "args": "{}"},
-        ]
-    )
-
-    assert message_chunk_text(message) == "你好"
+from research_agent.api.streaming_utils import approved_token_events, track_background_task
 
 
-def test_token_event_only_exposes_tagged_visible_nodes():
-    message = SimpleNamespace(content="你好")
+def test_approved_tokens_reconstruct_final_text():
+    final_text = "## 核心方法\n\n这是已经通过审阅并完成落库的最终正文。"
+    events = approved_token_events(final_text, "trace-test", chunk_size=8)
 
-    assert token_event_from_chunk(
-        message,
-        {"langgraph_node": "assistant", "langgraph_step": 1, "tags": ["context_summary"]},
-    ) is None
-    assert token_event_from_chunk(
-        message,
-        {"langgraph_node": "synthesizer", "langgraph_step": 2, "tags": ["assistant_visible"]},
-    ) is None
-    assert token_event_from_chunk(
-        message,
-        {"langgraph_node": "assistant", "langgraph_step": 3, "tags": ["assistant_visible"]},
-    ) == {
-        "type": "token",
-        "content": "你好",
-        "node": "assistant",
-        "stream_id": "assistant:3",
-    }
-    assert token_event_from_chunk(
-        message,
-        {"langgraph_node": "synthesizer", "langgraph_step": 4, "tags": ["synthesizer_visible"]},
-    ) == {
-        "type": "token",
-        "content": "你好",
-        "node": "synthesizer",
-        "stream_id": "synthesizer:4",
-    }
+    assert len(events) >= 2
+    assert "".join(event["content"] for event in events) == final_text
+    assert {event["stream_id"] for event in events} == {"final:approved"}
+    assert {event["trace_id"] for event in events} == {"trace-test"}
+
+
+def test_background_agent_survives_unrelated_consumer_cancellation():
+    async def scenario():
+        release = asyncio.Event()
+        persisted = []
+
+        async def background_agent():
+            await release.wait()
+            persisted.append("assistant final")
+
+        task = track_background_task(asyncio.create_task(background_agent()))
+        consumer = asyncio.create_task(asyncio.sleep(3600))
+        consumer.cancel()
+        try:
+            await consumer
+        except asyncio.CancelledError:
+            pass
+        release.set()
+        await task
+        return persisted
+
+    assert asyncio.run(scenario()) == ["assistant final"]
+
+
+def test_server_does_not_cancel_background_agent_on_sse_disconnect():
+    root = Path(__file__).resolve().parents[1]
+    source = (root / "research_agent" / "api" / "server.py").read_text(encoding="utf-8")
+
+    assert "agent_task.cancel()" not in source
+    assert "track_background_task(asyncio.create_task(complete_agent_run()))" in source

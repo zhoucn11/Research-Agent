@@ -135,7 +135,7 @@ function paintStreamFrame() {
         const chunkSize = Math.max(1, Math.ceil(streamBuffer.length / 36));
         streamingText += streamBuffer.slice(0, chunkSize);
         streamBuffer = streamBuffer.slice(chunkSize);
-        streamingMessage.querySelector('.bubble').textContent = streamingText;
+        streamingMessage.querySelector('.bubble').innerHTML = marked.parse(streamingText);
         chatBox.scrollTop = chatBox.scrollHeight;
     }
 
@@ -401,6 +401,7 @@ async function sendMessage() {
     logBox.innerHTML = '';
     appendLog('发起新任务...', 'highlight');
 
+    let receivedFinal = false;
     try {
         let response;
         if (files.length) {
@@ -447,11 +448,18 @@ async function sendMessage() {
                 } else if (data.type === 'token') {
                     appendStreamToken(data.content, data.stream_id);
                 } else if (data.type === 'final') {
+                    receivedFinal = true;
                     await finalizeStreamMessage(data.content);
                     appendLog('任务执行完毕', 'highlight');
                     await loadSessions({ reloadMessages: false });
                 }
             }
+        }
+        if (!receivedFinal) {
+            removeLoading();
+            discardStreamMessage();
+            appendMessage('连接已断开，任务仍在服务器后台执行；完成后刷新当前会话即可查看结果。', 'system');
+            appendLog('SSE 已断开，后台任务继续执行并会写入会话历史。', 'highlight');
         }
     } catch (error) {
         removeLoading();

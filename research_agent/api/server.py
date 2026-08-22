@@ -59,7 +59,7 @@ from research_agent.retrieval.index_jobs import (
     start_index_worker,
     stop_index_worker,
 )
-from research_agent.api.streaming_utils import token_event_from_chunk
+from research_agent.api.streaming_utils import approved_token_events, track_background_task
 
 
 app = FastAPI(title="Academic Research Agent API")
@@ -496,10 +496,14 @@ async def chat_endpoint(request: Request):
         state_input["selected_papers"] = "CLEAR"
         state_input["graph_evidence"] = "CLEAR"
 
+    # 用户消息先落库；即使页面刷新，问题本身也不会从会话历史中消失。
+    append_message(session_id, "user", raw_message or merged_message, user_id=user_id)
+
     output_queue = asyncio.Queue()
     trace_id = "trace_" + uuid.uuid4().hex[:16]
     create_trace_run(trace_id, session_id, user_id, research_mode)
     trace_started_at = time.perf_counter()
+    stream_started_at = time.perf_counter()
     trace_outcome = {"status": "running", "error": ""}
 
     def persist_trace_event(payload: dict) -> None:
@@ -510,35 +514,12 @@ async def chat_endpoint(request: Request):
             print(f"[TRACE] 轨迹写入失败: {type(exc).__name__}")
 
     async def run_agent():
-        stream_started_at = time.perf_counter()
-        first_visible_token_sent = False
         event_loop = asyncio.get_running_loop()
 
         def event_sink(payload: dict) -> None:
-            nonlocal first_visible_token_sent
+            # Graph 内部模型 token 仍是未完成草稿；只保留日志，最终文本统一在
+            # Guard、Reviewer 和持久化全部完成后由 complete_agent_run 发送。
             if payload.get("event") == "visible_token":
-                if not first_visible_token_sent:
-                    first_visible_token_sent = True
-                    ttft = time.perf_counter() - stream_started_at
-                    ttft_payload = {
-                        "event": "ttft",
-                        "content": f"[⏱️ TTFT] 首个可见 token: {ttft:.2f}s",
-                        "trace_id": trace_id,
-                        "session_id": session_id,
-                        "node": payload.get("node", "reviewer"),
-                        "timestamp": time.time(),
-                        "latency_ms": round(ttft * 1000, 2),
-                    }
-                    persist_trace_event(ttft_payload)
-                    event_loop.call_soon_threadsafe(output_queue.put_nowait, ("log", ttft_payload))
-                token_payload = {
-                    "type": "token",
-                    "content": str(payload.get("content") or ""),
-                    "node": str(payload.get("node") or "reviewer"),
-                    "stream_id": str(payload.get("stream_id") or "reviewer:approved"),
-                    "trace_id": trace_id,
-                }
-                event_loop.call_soon_threadsafe(output_queue.put_nowait, ("token", token_payload))
                 return
             persist_trace_event(payload)
             event_loop.call_soon_threadsafe(output_queue.put_nowait, ("log", payload))
@@ -551,18 +532,9 @@ async def chat_endpoint(request: Request):
                     config=config,
                     stream_mode="messages",
                 ):
-                    token_event = token_event_from_chunk(message_chunk, metadata)
-                    if token_event:
-                        token_event["trace_id"] = trace_id
-                        if not first_visible_token_sent:
-                            first_visible_token_sent = True
-                            ttft = time.perf_counter() - stream_started_at
-                            emit_runtime_event(
-                                "ttft",
-                                f"[⏱️ TTFT] 首个可见 token: {ttft:.2f}s",
-                                latency_ms=round(ttft * 1000, 2),
-                            )
-                        await output_queue.put(("token", token_event))
+                    # 必须消费 LangGraph 的消息流才能推进工作流，但不直接暴露
+                    # Assistant/Synthesizer 的原始 token。
+                    _ = message_chunk, metadata
                 checkpoint = await agent_app.aget_state(config)
                 total = time.perf_counter() - stream_started_at
                 emit_runtime_event(
@@ -571,18 +543,115 @@ async def chat_endpoint(request: Request):
                     latency_ms=round(total * 1000, 2),
                 )
                 trace_outcome["status"] = "completed"
-                await output_queue.put(("eof", None))
                 return checkpoint.values
             except asyncio.CancelledError:
                 trace_outcome["status"] = "cancelled"
-                emit_runtime_event("workflow_cancelled", "[SYSTEM] 客户端断开，任务已在最近 checkpoint 停止。")
+                emit_runtime_event("workflow_cancelled", "[SYSTEM] 服务关闭，后台 Agent 任务已取消。")
                 raise
             except Exception as exc:
                 trace_outcome["status"] = "failed"
                 trace_outcome["error"] = f"{type(exc).__name__}: {exc}"
                 emit_runtime_event("workflow_error", f"系统异常: {exc}")
-                await output_queue.put(("eof", None))
                 return None
+
+    async def complete_agent_run():
+        """完成 Agent、约束最终正文并先落库，再向仍连接的客户端发送。"""
+        final_content = ""
+        assistant_persisted = False
+        try:
+            final_state = await run_agent()
+            if final_state:
+                final_messages = final_state.get("messages", [])
+                if final_messages and getattr(final_messages[-1], "content", "").strip():
+                    final_content = final_messages[-1].content
+                else:
+                    final_content = "经过多轮检索，暂时没有得到有效结果，请尝试缩小问题范围。"
+            else:
+                final_content = "任务执行失败，请检查模型配置或稍后重试。"
+
+            constraint_memory = "\n".join(
+                part for part in (
+                    persistent_summary,
+                    str(final_state.get("summary", "") or "") if final_state else "",
+                )
+                if part
+            )
+            final_content = apply_response_constraints(
+                final_content,
+                raw_message or merged_message,
+                constraint_memory,
+            )
+
+            append_message(session_id, "assistant", final_content, user_id=user_id)
+            assistant_persisted = True
+            if final_state and final_state.get("summary"):
+                update_session_summary(session_id, final_state.get("summary", ""), user_id=user_id)
+            update_user_profile_from_turn(raw_message or merged_message, final_content, user_id=user_id)
+
+            if evaluation_mode:
+                await output_queue.put(("data", _evaluation_retrieval_event(final_state, trace_id)))
+
+            finish_trace_run(
+                trace_id,
+                trace_outcome["status"] if trace_outcome["status"] != "running" else "failed",
+                latency_ms=round((time.perf_counter() - trace_started_at) * 1000, 2),
+                error=trace_outcome["error"],
+                final_chars=len(final_content),
+            )
+
+            ttft = time.perf_counter() - stream_started_at
+            ttft_payload = {
+                "event": "ttft",
+                "content": f"[⏱️ TTFT] 首个已审阅 token: {ttft:.2f}s",
+                "trace_id": trace_id,
+                "session_id": session_id,
+                "node": "final",
+                "timestamp": time.time(),
+                "latency_ms": round(ttft * 1000, 2),
+            }
+            persist_trace_event(ttft_payload)
+            await output_queue.put(("log", ttft_payload))
+            for token_payload in approved_token_events(final_content, trace_id):
+                await output_queue.put(("token", token_payload))
+            await output_queue.put(("data", {
+                "type": "final",
+                "content": final_content,
+                "trace_id": trace_id,
+            }))
+        except asyncio.CancelledError:
+            trace_outcome["status"] = "cancelled"
+            finish_trace_run(
+                trace_id,
+                "cancelled",
+                latency_ms=round((time.perf_counter() - trace_started_at) * 1000, 2),
+                error="Server shutdown cancelled the background task",
+                final_chars=len(final_content),
+            )
+            raise
+        except Exception as exc:
+            trace_outcome["status"] = "failed"
+            trace_outcome["error"] = f"{type(exc).__name__}: {exc}"
+            fallback_content = final_content or "任务收尾失败，请稍后刷新会话或重试。"
+            if not assistant_persisted:
+                try:
+                    append_message(session_id, "assistant", fallback_content, user_id=user_id)
+                    assistant_persisted = True
+                except Exception:
+                    pass
+            finish_trace_run(
+                trace_id,
+                "failed",
+                latency_ms=round((time.perf_counter() - trace_started_at) * 1000, 2),
+                error=trace_outcome["error"],
+                final_chars=len(fallback_content) if assistant_persisted else 0,
+            )
+            await output_queue.put(("data", {
+                "type": "final",
+                "content": fallback_content,
+                "trace_id": trace_id,
+            }))
+        finally:
+            await output_queue.put(("eof", None))
 
     async def event_generator():
         yield f"data: {json.dumps({'type': 'log', 'content': '[SYSTEM] Agent workflow starting.', 'trace_id': trace_id})}\n\n"
@@ -590,77 +659,31 @@ async def chat_endpoint(request: Request):
         for log_line in pre_logs:
             yield f"data: {json.dumps({'type': 'log', 'content': log_line})}\n\n"
 
-        agent_task = asyncio.create_task(run_agent())
-        received_eof = False
-
         try:
             while True:
                 event_type, payload = await output_queue.get()
                 if event_type == "eof":
-                    received_eof = True
                     break
                 if event_type == "token":
+                    yield f"data: {json.dumps(payload)}\n\n"
+                elif event_type == "data":
                     yield f"data: {json.dumps(payload)}\n\n"
                 else:
                     log_event = dict(payload) if isinstance(payload, dict) else {"content": str(payload)}
                     log_event["type"] = "log"
                     yield f"data: {json.dumps(log_event)}\n\n"
         except asyncio.CancelledError:
-            trace_outcome["status"] = "cancelled"
+            persist_trace_event({
+                "event": "client_disconnected",
+                "content": "[SYSTEM] 客户端连接已断开，后台任务继续执行并将在完成后落库。",
+                "trace_id": trace_id,
+                "session_id": session_id,
+                "node": "api",
+                "timestamp": time.time(),
+            })
             raise
-        finally:
-            if not received_eof and not agent_task.done():
-                agent_task.cancel()
 
-            if not received_eof:
-                finish_trace_run(
-                    trace_id,
-                    trace_outcome["status"] if trace_outcome["status"] != "running" else "cancelled",
-                    latency_ms=round((time.perf_counter() - trace_started_at) * 1000, 2),
-                    error=trace_outcome["error"],
-                )
-
-        final_state = await agent_task
-        if final_state:
-            final_messages = final_state.get("messages", [])
-            if final_messages and getattr(final_messages[-1], "content", "").strip():
-                final_content = final_messages[-1].content
-            else:
-                final_content = "经过多轮检索，暂时没有得到有效结果，请尝试缩小问题范围。"
-        else:
-            final_content = "任务执行失败，请检查模型配置或稍后重试。"
-
-        constraint_memory = "\n".join(
-            part for part in (
-                persistent_summary,
-                str(final_state.get("summary", "") or "") if final_state else "",
-            )
-            if part
-        )
-        final_content = apply_response_constraints(
-            final_content,
-            raw_message or merged_message,
-            constraint_memory,
-        )
-
-        if evaluation_mode:
-            yield f"data: {json.dumps(_evaluation_retrieval_event(final_state, trace_id))}\n\n"
-
-        append_message(session_id, "user", raw_message or merged_message, user_id=user_id)
-        append_message(session_id, "assistant", final_content, user_id=user_id)
-        if final_state and final_state.get("summary"):
-            update_session_summary(session_id, final_state.get("summary", ""), user_id=user_id)
-        update_user_profile_from_turn(raw_message or merged_message, final_content, user_id=user_id)
-
-        finish_trace_run(
-            trace_id,
-            trace_outcome["status"] if trace_outcome["status"] != "running" else "failed",
-            latency_ms=round((time.perf_counter() - trace_started_at) * 1000, 2),
-            error=trace_outcome["error"],
-            final_chars=len(final_content),
-        )
-
-        yield f"data: {json.dumps({'type': 'final', 'content': final_content, 'trace_id': trace_id})}\n\n"
+    track_background_task(asyncio.create_task(complete_agent_run()))
 
     return StreamingResponse(
         event_generator(),
