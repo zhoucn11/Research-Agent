@@ -49,13 +49,13 @@ REVIEWER_BASE_URL=https://api.moonshot.cn/v1
 REVIEWER_API_KEY=your-moonshot-api-key
 REVIEWER_MODEL=kimi-k2.6
 REVIEWER_LLM_ENABLED=true
-# Reviewer 显式开启 Kimi K2.6 思考，并按官方约束发送 temperature=1.0
+# Reviewer 使用 Kimi K2.6 非思考模式，并按官方约束发送 temperature=0.6
 # 两类长文本任务分别控制超时和最大输出
 SYNTHESIS_TIMEOUT=300
 SYNTHESIS_MAX_OUTPUT_TOKENS=4096
 REVIEWER_TIMEOUT=300
-REVIEWER_MAX_OUTPUT_TOKENS=8192
-REVIEW_PACKET_MAX_CHARS=180000
+REVIEWER_MAX_OUTPUT_TOKENS=4096
+REVIEW_PACKET_MAX_CHARS=96000
 RAG_EVIDENCE_SPANS_PER_SOURCE=3
 
 # provider 级并发、重试与熔断
@@ -131,7 +131,7 @@ FastAPI 启动时默认使用 `AsyncSqliteSaver`，checkpoint 写入独立的 `a
 
 PDF 上传后的 DeepDoc 解析和 LightRAG 建图已移出聊天请求链路。`index_jobs.sqlite3` 保存 `queued/parsing/indexing/completed/failed/cancelled` 状态、进度、失败原因和尝试次数；服务重启会把中断任务恢复为 `queued`，失败或取消任务通过 `POST /api/index-jobs/{job_id}/retry` 显式重试。`GET /api/index-jobs` 和 `GET /api/index-jobs/{job_id}` 查询进度，`DELETE` 只允许取消尚未执行的任务。聊天只使用 manifest 中真正完成且物理文件仍存在的论文，上传后未完成时返回明确状态，不再一边聊天一边建图，也不写假成功。
 
-候选论文升级现在由 `EvidenceGateResult` 确定性控制，而不是只看“总结/对比”意图：点名标题必须精确命中；对比至少覆盖两篇不同论文和两个来源；作者、年份、DOI 等按问题要求检查；本地内容性结论必须带真实 `EvidenceSpan`。失败会返回逐项缺口，模型输出 `[APPROVE_SYNTHESIS]` 也不能绕过。Reviewer 接收用户问题、初稿、论文元数据、全部页级 span 和图谱证据组成的只读包，输出结构化 `ReviewResult`；存在 unsupported、unclear 或 citation_error 时驳回，最多隐藏返修一次，仍不通过就降级为可回链证据摘要。Assistant/Synthesizer 的原始生成 token 不再直接对用户可见；最终正文经过 Guard、Reviewer、输出约束并成功落库后，才切块发送 `token` 和唯一 `final`，因此 token 拼接严格等于 final。
+候选论文升级现在由 `EvidenceGateResult` 确定性控制，而不是只看“总结/对比”意图：点名标题必须精确命中；对比至少覆盖两篇不同论文和两个来源；作者、年份、DOI 等按问题要求检查；本地内容性结论必须带真实 `EvidenceSpan`。失败会返回逐项缺口，模型输出 `[APPROVE_SYNTHESIS]` 也不能绕过。编号、字段、引用格式和无页级证据数值继续由代码 Guard 处理；Reviewer 使用 Kimi K2.6 非思考模式，只接收初稿、论文元数据和每篇最多 5 条相关 EvidenceSpan，检查来源错配与语义幻觉。首次审查不通过会把结构化问题交回 Synthesizer 做一次定向返修，再进行第二次审阅；二审仍不通过才降级为可回链证据摘要。429、超时或非法 JSON 标记为 `review_unavailable`，保留确定性 Guard 后的初稿且不触发返修。Assistant/Synthesizer 的原始生成 token 不再直接对用户可见；最终正文经过 Guard、Reviewer、输出约束并成功落库后，才切块发送 `token` 和唯一 `final`，因此 token 拼接严格等于 final。
 
 “讲一下第一篇”“说一下第二篇”“展开讲”等口语化单篇跟进由代码直接归一为内容解读意图：先按上一轮稳定编号锁定论文，再检查核心字段和真实 `EvidenceSpan`，通过后进入 Synthesizer/Reviewer；不再把检索后的二次决策交给 Assistant 模型。`retrieval_result` 轨迹同时记录 `evidence_span_count`，用于区分“意图未命中”和“页级证据确实缺失”。
 

@@ -72,7 +72,7 @@ python scripts/evaluate_agent.py --rescore-existing AGENT_EVAL_RESULTS.json
 | 会话格式记忆 | 先记住`最多三句话`再追问 | 最终 SSE `final` 和数据库消息均不超过三句话 |
 | 本地清单快路径 | `我本地有哪些文献` | 读取 manifest/full_docs，不出现 LightRAG 图查询和证据抽取日志 |
 | 证据升级门 | 点名不存在标题，或只有一篇来源却要求对比 | 不进入 Synthesizer；明确列出标题、来源、字段或 EvidenceSpan 缺口 |
-| Reviewer 驳回与返修 | 构造包含无证据指标的综述 | 未审初稿不产生 token；最多返修一次，第二次失败输出“证据审阅未通过”的安全摘要 |
+| Reviewer 幻觉审查 | 构造包含无证据指标或来源错配的综述 | 首审返回结构化问题并触发一次定向返修；二审仍不通过才输出安全摘要；接口异常不触发返修 |
 | 后台建图恢复 | 上传新 PDF 后立即提问，再重启服务 | 上传接口立即返回排队日志；查询只显示 queued/parsing/indexing；重启后任务恢复，只有 completed 后才可检索 |
 | 后台任务接口 | 查询、取消或重试索引任务 | `GET /api/index-jobs` 可见状态；queued 可取消；failed/cancelled 可 retry；失败原因保留 |
 | 跨会话长期画像 | A 会话记住“以后最多三句话”，B 会话追问 | Assistant/Synthesizer 遵守三句话；画像不得改变工具路由或绕过证据门；删除画像后不再生效 |

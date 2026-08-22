@@ -6,7 +6,7 @@
 
 > 2026-08-20 更新：项目级 Skill 已收敛为 Synthesizer 专用的 `literature-review-writing`。检索和引用核验不再通过 Skill 注入 Assistant，而由现有路由、停止条件和元数据校验代码负责；写作 Skill 只组织已确认的论文证据，不具备检索或改写证据的权限。
 
-> 2026-08-20 可靠性更新：`candidate_papers` 通过确定性 Evidence Gate 后才能升级；Reviewer 改为页级证据结构化裁决并支持一次返修；PDF 解析和 LightRAG 建图迁移为可恢复后台任务；长期用户画像以低优先级偏好数据参与 Assistant/Synthesizer。
+> 2026-08-20 可靠性更新：`candidate_papers` 通过确定性 Evidence Gate 后才能升级；Reviewer 改为来源归属与语义幻觉的结构化裁决，并保留一次定向返修与二次审阅；PDF 解析和 LightRAG 建图迁移为可恢复后台任务；长期用户画像以低优先级偏好数据参与 Assistant/Synthesizer。
 
 > 2026-08-21 工程更新：Assistant 与上下文压缩迁移到主 Qwen API，Reviewer 继续独占 Kimi；三类 provider 使用独立并发、分类重试和熔断。Tool 参数改由 Pydantic 确定性裁决，执行轨迹脱敏持久化到 SQLite，并提供 trace 查询接口。
 
@@ -90,7 +90,7 @@ Assistant 的 prompt 很长，是因为它承担了路由、证据审查和行�
 
 ## 十一、Synthesizer 与 Reviewer
 
-`agents/synthesis_agent.py` 负责把 selected_papers 写成综述，Reviewer 负责证据裁决而不是润色。写作节点只读取 selected_papers；候选论文必须先通过精确标题、来源数量、必要字段和 EvidenceSpan 覆盖检查。Reviewer 收到用户问题、初稿、论文元数据、页级 span 和图谱证据组成的只读包，返回结构化 passed/issues 裁决；驳回后最多隐藏返修一次，仍不通过就只输出可回链证据摘要。
+`agents/synthesis_agent.py` 负责把 selected_papers 写成综述，Reviewer 负责证据裁决而不是润色。写作节点只读取 selected_papers；候选论文必须先通过精确标题、来源数量、必要字段和 EvidenceSpan 覆盖检查。编号、字段、引用格式和无证据数值由代码 Guard 判断；Reviewer 使用 Kimi K2.6 非思考模式，只接收压缩后的初稿、论文元数据和每篇最多 5 条 EvidenceSpan，检查来源错配与语义幻觉。首审不通过只把结构化问题交回 Synthesizer 做一次定向返修，二审仍不通过才输出可回链证据摘要；接口不可用不会被误判成内容驳回，也不会触发返修。
 
 Assistant、上下文压缩和 Synthesizer 复用 `OPENAI_BASE_URL/OPENAI_API_KEY/OPENAI_MODEL` 对应的主 Qwen；Reviewer 通过 `REVIEWER_BASE_URL/REVIEWER_API_KEY/REVIEWER_MODEL` 独占 Kimi。Reviewer 配置缺失时不再回退主模型，而是输出可回链证据摘要。主 API、Reviewer 和本地 vLLM 分别配置并发、超时、分类重试和熔断，避免模型故障相互传染。
 
@@ -170,7 +170,7 @@ MCP 的参考价值最大。MCP 把能力分成 Tools、Resources、Prompts：To
 回答：当前图片是多模态前置归一化，先由视觉模型转成文本，然后把文本并入用户问题，再交给原有 Agent 流程。所以日志会显示 VISION 完成，但不一定进入 RAG 或 Synthesizer。只有图片转出的文本和用户指令触发了本地检索、联网搜索或综述写作，才会进入对应 Agent 节点。这个方案牺牲了一点端到端多模态能力，但稳定、易调试、和现有文本 Agent 兼容。
 
 问题：你的系统如何降低幻觉？
-回答：主要有几层：本地 RAG 只查 manifest 真完成的 PDF；联网结果和本地库严格隔离；PDF 入库在可恢复后台任务中完成；元数据交叉校验有标题相似度门槛；Evidence Gate 阻止不完整候选进入写作；Synthesizer 只基于结构化证据生成；Reviewer 逐声明做页级证据裁决，最多返修一次，失败安全降级。
+回答：主要有几层：本地 RAG 只查 manifest 真完成的 PDF；联网结果和本地库严格隔离；PDF 入库在可恢复后台任务中完成；元数据交叉校验有标题相似度门槛；Evidence Gate 阻止不完整候选进入写作；Synthesizer 只基于结构化证据生成；代码 Guard 检查编号、字段和数值，Reviewer 检查来源错配与语义幻觉，首审失败只允许一次定向返修，二审仍失败才安全降级。
 
 问题：如果让你继续优化，你优先做什么？
 回答：我会先做评测和证据追踪，因为这是生产级 RAG 的底座。具体是建立查询-相关论文-相关 chunk 的评测集，统计 recall 和 citation accuracy；然后把最终综述每句话绑定 source/chunk/page。第二步做 GraphRAG/RAPTOR，解决全库主题归纳和跨论文综述。第三步做 MCP 化，把 RAG、搜索、Vision、文件资源标准化为工具和资源，提升可扩展性。

@@ -7,7 +7,7 @@
 - 本地论文：DeepDoc 解析 PDF，LightRAG 联合实体、关系和原文 chunk 检索。
 - 联网检索：接入 Semantic Scholar，支持精确标题和主题检索、限速与有限重试。
 - 证据治理：候选论文只有通过标题、来源、字段和页级证据检查后才能进入综述。
-- 多 Agent：Assistant 负责路由，RAG/Search 负责取证，Synthesizer 负责写作，独立 Reviewer 负责结构化裁决与一次返修。
+- 多 Agent：Assistant 负责路由，RAG/Search 负责取证，Synthesizer 负责写作，独立 Reviewer 检查来源归属与语义幻觉，并允许一次定向返修与二次审阅。
 - 工程闭环：FastAPI + SSE + SQLite 会话/检查点/轨迹，PDF 建图任务支持排队、恢复、失败记录和显式重试。
 
 主要目录：
@@ -61,10 +61,10 @@ Copy-Item .env.example .env
 
 ```bash
 python -m vllm.entrypoints.openai.api_server \
-  --model /path/to/Qwen3-8B \
+  --model /root/autodl-tmp/financial-report-rag/models/qwen/Qwen3-8B \
   --served-model-name qwen3 \
   --max-model-len 16384 \
-  --gpu-memory-utilization 0.60 \
+  --gpu-memory-utilization 0.80 \
   --dtype half \
   --enforce-eager \
   --max-num-seqs 1 \

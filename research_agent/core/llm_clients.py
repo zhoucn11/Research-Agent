@@ -86,7 +86,7 @@ def get_reviewer_llm(temperature=0.0, streaming=False, max_tokens: int | None = 
         raise RuntimeError("Reviewer 已启用但缺少独立配置: " + ", ".join(missing))
 
     timeout = int(os.environ.get("REVIEWER_TIMEOUT", os.environ.get("LLM_TIMEOUT", 300)))
-    output_limit = max_tokens or int(os.environ.get("REVIEWER_MAX_OUTPUT_TOKENS", "8192"))
+    output_limit = max_tokens or int(os.environ.get("REVIEWER_MAX_OUTPUT_TOKENS", "4096"))
     is_kimi_k2 = model_name.lower() in {"kimi-k2.5", "kimi-k2.6"}
     client_options = dict(
         model=model_name,
@@ -95,13 +95,14 @@ def get_reviewer_llm(temperature=0.0, streaming=False, max_tokens: int | None = 
         timeout=timeout,
         streaming=streaming,
         max_tokens=output_limit,
+        max_retries=0,
         extra_body=(
-            {"thinking": {"type": "enabled"}}
+            {"thinking": {"type": "disabled"}}
             if is_kimi_k2
             else _qwen_extra_body(model_name)
         ),
     )
-    client_options["temperature"] = 1.0 if is_kimi_k2 else temperature
+    client_options["temperature"] = 0.6 if is_kimi_k2 else temperature
     return ChatOpenAI(**client_options)
 
 

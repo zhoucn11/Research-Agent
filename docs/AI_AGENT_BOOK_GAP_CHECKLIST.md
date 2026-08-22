@@ -21,7 +21,7 @@
 ## 2026-08-20 已完成的闭环
 
 - `EvidenceGateResult` 已在候选证据升级前检查精确标题、来源数量、必要字段和页级证据覆盖，并返回具体缺口。
-- Reviewer 已使用只读 `ReviewPacket` 和结构化 `ReviewResult`；不通过时最多返修一次，再失败降级为安全证据摘要，未审初稿不对外流式展示。
+- Reviewer 已使用压缩只读 `ReviewPacket` 和结构化 `ReviewResult`；检查来源错配与语义幻觉，首审不通过最多触发一次定向返修和二审，二审仍失败才降级为安全证据摘要，接口不可用时保留确定性 Guard 后的初稿。
 - PDF 解析与 LightRAG 建图已迁移为 SQLite 持久化后台任务，支持状态查询、中断恢复、失败原因、取消和显式重试；聊天只读 completed 文档。
 - `user_profile` 已作为低优先级偏好数据注入 Assistant/Synthesizer，并防止画像内容改变路由、工具和证据边界。
 
