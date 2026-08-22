@@ -241,7 +241,8 @@ async def _attach_page_evidence(
     if not results:
         return
     sources = [str(paper.source) for paper in results if not str(paper.source).startswith("http")]
-    spans_by_source = load_relevant_evidence_spans(sources, query, per_source=3)
+    span_limit = max(1, int(os.environ.get("RAG_EVIDENCE_SPANS_PER_SOURCE", "5")))
+    spans_by_source = load_relevant_evidence_spans(sources, query, per_source=span_limit)
 
     if enable_local_rerank and spans_by_source:
         try:
@@ -256,7 +257,6 @@ async def _attach_page_evidence(
         except Exception as exc:
             print(f"  └─ ⚠️ 本地页级证据重排失败，保留词法排序: {exc}")
 
-    span_limit = max(1, int(os.environ.get("RAG_EVIDENCE_SPANS_PER_SOURCE", "3")))
     for paper in results:
         spans = spans_by_source.get(str(paper.source), [])[:span_limit]
         paper.evidence_spans = [EvidenceSpan(**span) for span in spans]
