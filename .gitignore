@@ -1,0 +1,52 @@
+# Python / IDE
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.pydeps/
+.venv/
+venv/
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# Secrets: only commit .env.example
+.env
+.env.*
+!.env.example
+
+# Runtime databases and generated data
+agent_memory.sqlite3*
+agent_checkpoints.sqlite3*
+index_jobs.sqlite3*
+agent_traces.sqlite3*
+lightrag_storage/
+uploaded_assets/
+test_pdfs/
+.tmp/
+tmp/
+*.log
+
+# Local models
+models/
+*.onnx
+*.pt
+*.pth
+*.safetensors
+
+# Personal notes and generated evaluation reports
+Research Agent*.docx
+指令.txt
+AGENT_EVAL_RESULTS.json
+AGENT_EVAL_REPORT.md
+
+# Publish only representative regression tests; keep the full local suite locally.
+tests/*
+!tests/test_evaluate_agent.py
+!tests/test_index_jobs.py
+!tests/test_lightrag_manifest.py
+!tests/test_llm_resilience.py
+!tests/test_memory_user_isolation.py
+!tests/test_reviewer_workflow.py
+!tests/test_streaming_utils.py
+!tests/test_tool_validation.py

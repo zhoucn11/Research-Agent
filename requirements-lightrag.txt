@@ -1,0 +1,2 @@
+# 兼容旧部署命令；完整依赖统一维护在 requirements.txt。
+-r requirements.txt

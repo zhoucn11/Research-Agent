@@ -1,0 +1,43 @@
+# Web/API
+fastapi>=0.115,<1
+uvicorn[standard]>=0.30,<1
+python-multipart>=0.0.9,<1
+pydantic>=2.8,<3
+python-dotenv>=1.0,<2
+
+# Agent and LLM clients
+langgraph>=0.2,<2
+langgraph-checkpoint-sqlite>=2.0,<5
+langchain-core>=0.3,<2
+langchain-openai>=0.2,<2
+langchain-community>=0.3,<1
+langchain-classic>=1.0,<2
+langchain-huggingface>=0.1,<1
+openai>=1.99,<3
+aiosqlite>=0.20,<1
+
+# LightRAG and retrieval
+lightrag-hku>=1.5.4,<1.6
+numpy>=1.26,<3
+requests>=2.31,<3
+beautifulsoup4>=4.12,<5
+tqdm>=4.66,<5
+sentence-transformers>=3,<6
+torch>=2.2
+
+# PDF / DeepDoc runtime
+beartype>=0.18,<1
+pdfplumber>=0.11,<1
+pypdf>=4,<7
+Pillow>=10,<13
+opencv-python-headless>=4.9,<5
+onnxruntime-gpu>=1.18,<2
+huggingface-hub>=0.24,<1
+xgboost>=2,<4
+scikit-learn>=1.4,<2
+shapely>=2,<3
+pyclipper>=1.3,<2
+six>=1.16,<2
+
+# Published regression tests
+pytest>=8,<10

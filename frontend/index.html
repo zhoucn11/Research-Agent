@@ -1,0 +1,99 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Academic Research Agent</title>
+    <link rel="stylesheet" href="style.css?v=codex-3">
+    <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+</head>
+<body>
+    <div class="app-shell">
+        <aside class="session-sidebar">
+            <div class="sidebar-brand">
+                <div class="brand-mark" aria-hidden="true">
+                    <svg viewBox="0 0 24 24" fill="none">
+                        <path d="M7 4.75h6.1a3.4 3.4 0 0 1 0 6.8H7m5.1 0 5 7.7M7 4.75v14.5" />
+                        <path d="M16.75 3.25v3.5M15 5h3.5" />
+                    </svg>
+                </div>
+                <div>
+                    <h1>Research Agent</h1>
+                    <p>AI Research Workspace</p>
+                </div>
+            </div>
+
+            <button id="new-session-btn" class="new-session-btn" type="button">
+                <span class="new-session-icon" aria-hidden="true">＋</span>
+                新建研究会话
+                <span class="new-session-shortcut" aria-hidden="true">N</span>
+            </button>
+
+            <div class="session-section-title">历史会话</div>
+            <div id="session-list" class="session-list"></div>
+        </aside>
+
+        <main class="workspace">
+            <section class="chat-container">
+                <header class="chat-header">
+                    <div class="chat-heading">
+                        <span class="chat-eyebrow">RESEARCH WORKSPACE · 研究工作台</span>
+                        <h2 id="current-session-title">Academic Research Copilot</h2>
+                        <p>支持本地 PDF RAG、联网学术搜索、图文输入预处理和长期记忆</p>
+                    </div>
+                    <div class="header-status" title="服务运行中">
+                        <span class="status-dot" aria-hidden="true"></span>
+                        Local · Web
+                    </div>
+                </header>
+
+                <div class="chat-box" id="chat-box"></div>
+
+                <div class="input-area">
+                    <div class="input-stack">
+                        <textarea id="user-input" rows="2" placeholder="向 Research Agent 提问…"></textarea>
+                        <div class="file-row">
+                            <label class="file-picker">
+                                <svg viewBox="0 0 24 24" fill="none" aria-hidden="true">
+                                    <path d="m12.6 6.4-5.3 5.3a3.2 3.2 0 0 0 4.5 4.5l6.3-6.3a4.4 4.4 0 0 0-6.2-6.2L5.3 10.3a5.6 5.6 0 1 0 7.9 7.9l5.2-5.2" />
+                                </svg>
+                                选择附件
+                                <input id="file-input" type="file" multiple accept="image/*,.pdf,application/pdf">
+                            </label>
+                            <div id="selected-files" class="selected-files">未选择附件</div>
+                            <label class="mode-picker" title="快速模式降低检索预算；深度模式用于跨论文分析">
+                                <span>模式</span>
+                                <select id="research-mode" aria-label="研究模式">
+                                    <option value="auto">自动</option>
+                                    <option value="quick">快速</option>
+                                    <option value="deep">深度</option>
+                                </select>
+                            </label>
+                            <span class="input-hint">Enter 发送 · Shift + Enter 换行</span>
+                        </div>
+                        <button id="send-btn" class="send-btn" type="button" title="发送消息" aria-label="发送消息">
+                            <svg viewBox="0 0 24 24" fill="none" aria-hidden="true">
+                                <path d="M12 19V5m0 0-5 5m5-5 5 5" />
+                            </svg>
+                        </button>
+                    </div>
+                </div>
+            </section>
+
+            <aside class="log-panel">
+                <div class="log-header">
+                    <div class="log-title">
+                        <span class="log-status-dot" aria-hidden="true"></span>
+                        <h3>Agent activity</h3>
+                    </div>
+                    <span class="log-badge">LIVE</span>
+                </div>
+                <div class="log-content" id="log-box">
+                    <div class="log-item">等待任务输入...</div>
+                </div>
+            </aside>
+        </main>
+    </div>
+    <script src="script.js"></script>
+</body>
+</html>
