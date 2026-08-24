@@ -29,7 +29,7 @@ deepdoc/                     RAGFlow/DeepDoc 风格 PDF 解析适配
 - Linux + NVIDIA GPU（PDF 解析和本地模型推荐）
 - 一个 OpenAI Chat Completions 兼容的主模型 API
 - 一个本地 vLLM 服务，用于 LightRAG 建图和低风险批处理
-- 本地 Embedding、Reranker 和 DeepDoc 模型权重
+- DeepDoc 模型权重（默认放在仓库内的 `models/deepdoc/`）
 
 本仓库不提交 API Key、模型权重、论文原文、SQLite 数据库或已生成的 LightRAG 图谱。
 
@@ -61,7 +61,7 @@ Copy-Item .env.example .env
 
 ```bash
 python -m vllm.entrypoints.openai.api_server \
-  --model /root/autodl-tmp/financial-report-rag/models/qwen/Qwen3-8B \
+  --model Qwen/Qwen3-8B \
   --served-model-name qwen3 \
   --max-model-len 16384 \
   --gpu-memory-utilization 0.80 \
@@ -89,21 +89,9 @@ CLI 模式：
 python main.py
 ```
 
-## 测试
-
-仓库只保留代表性的确定性回归测试；完整内部测试集不参与发布：
-
-```bash
-python -m pytest -q
-```
-
-真实 vLLM、GPU PDF 解析、LightRAG 图查询和联网 API 需要在服务器环境验收。
-
 ## 安全说明
 
 - 不要提交 `.env`，公开仓库只保留 `.env.example`。
 - 不要提交 `lightrag_storage/`、`test_pdfs/`、`uploaded_assets/` 和模型权重。
 - PDF 与网页正文均视为不可信数据，不允许其中的指令改变 Agent 控制流。
 - 页级引用只能来自真实 LightRAG chunk，证据不足时必须明确停止或降级。
-
-更完整的架构、上下文策略与评测说明见 [`docs/`](docs/)。

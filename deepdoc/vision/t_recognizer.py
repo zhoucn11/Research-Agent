@@ -31,8 +31,6 @@ from deepdoc.vision import LayoutRecognizer, TableStructureRecognizer, OCR, init
 import argparse
 import re
 import numpy as np
-def get_project_base_directory():
-    return os.environ.get("DEEPDOC_PROJECT_ROOT", r"/root/autodl-tmp/financial-report-rag")
 
 class MockSettings:
     PARALLEL_DEVICES = 0

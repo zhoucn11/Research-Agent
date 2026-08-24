@@ -3,7 +3,7 @@ from __future__ import annotations
 import re
 from datetime import datetime, timezone
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 
 class StrictToolInput(BaseModel):
@@ -23,14 +23,20 @@ class WebSearchInput(StrictToolInput):
     )
     keyword: str = Field(
         min_length=2,
-        max_length=120,
-        description="只能是 2-5 个英文关键词，禁止句子、引号、括号、AND/OR、斜杠和加号。",
+        max_length=240,
+        description="通常是 2-5 个英文关键词；精确标题检索可使用 user_core_topic 中《》包裹的完整标题。",
     )
     year_range: str = Field(default="", max_length=9, description="空字符串、YYYY 或 YYYY-YYYY。")
 
-    @field_validator("keyword")
-    @classmethod
-    def validate_keyword(cls, value: str) -> str:
+    @model_validator(mode="after")
+    def validate_keyword(self):
+        value = " ".join(self.keyword.split())
+        explicit_titles = re.findall(r"《([^》]{4,200})》", self.user_core_topic)
+        normalize = lambda text: re.sub(r"[^a-z0-9]+", "", str(text or "").casefold())
+        if any(normalize(value) == normalize(title) for title in explicit_titles):
+            self.keyword = value
+            return self
+
         words = value.split()
         if not 2 <= len(words) <= 5:
             raise ValueError("keyword 必须包含 2-5 个英文关键词")
@@ -38,7 +44,8 @@ class WebSearchInput(StrictToolInput):
             raise ValueError("keyword 只能包含英文、数字、点和连字符，不允许引号、括号或运算符")
         if any(word.casefold() in {"and", "or"} for word in words):
             raise ValueError("keyword 不允许 AND/OR 布尔运算符")
-        return " ".join(words)
+        self.keyword = " ".join(words)
+        return self
 
     @field_validator("year_range")
     @classmethod

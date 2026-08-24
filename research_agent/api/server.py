@@ -41,6 +41,7 @@ from research_agent.memory.memory_store import (
     get_session_summary,
     get_user_profile,
     init_memory_store,
+    is_persistable_user_profile_message,
     list_sessions,
     profile_to_text,
     rename_session,
@@ -413,10 +414,16 @@ async def chat_endpoint(request: Request):
             _append_session_preference(session_id, merged_message, user_id)
             final_content = "已记录为本会话约定，只会影响当前会话。"
             pre_logs.append("[MEMORY] 已写入本会话记忆。")
-        else:
+        elif is_persistable_user_profile_message(raw_message or merged_message):
             update_user_profile_from_turn(raw_message or merged_message, "", user_id=user_id)
             final_content = "已记录为长期偏好，后续会话会尽量遵循。"
             pre_logs.append("[MEMORY] 已写入长期用户偏好。")
+        else:
+            final_content = (
+                "这条内容属于具体任务事实或单轮约束，不会写入长期画像。"
+                "长期画像只保存明确的语言、篇幅、排版偏好和研究方向。"
+            )
+            pre_logs.append("[MEMORY] 已拒绝将任务事实写入长期用户画像。")
         append_message(session_id, "assistant", final_content, user_id=user_id)
 
         async def memory_event_generator():

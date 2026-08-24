@@ -24,7 +24,7 @@ _PLACEHOLDER_TEXTS = {
 _SUMMARY_MARKERS = (
     "总结", "综述", "概括", "归纳", "相关工作", "整理成", "写成", "写进论文",
     "可直接写", "段落", "小节框架", "论文表述", "文献综述", "怎么讲", "讲了什么",
-    "主要讲", "讲一下", "说一下", "展开讲", "详细讲", "介绍", "解读", "分析",
+    "主要讲", "讲一下", "说一下", "展开讲", "详细讲", "介绍", "解读", "分析", "综合结论",
     "列出", "清单", "有哪些",
 )
 _COMPARISON_MARKERS = ("对比", "比较", "区别", "差异", "异同")
@@ -41,6 +41,10 @@ def is_local_catalog_request(user_text: str) -> bool:
     catalog_intent = any(marker in compact for marker in (
         "有哪些文献", "有哪些论文", "有什么文献", "有什么论文",
         "列出文献", "列出论文", "文献清单", "论文清单", "文献列表", "论文列表",
+    ))
+    catalog_intent = catalog_intent or bool(re.search(
+        r"(?:列出|罗列|展示|返回).{0,16}(?:所有|全部|已有|目前)?(?:论文|文献)",
+        compact,
     ))
     return local_scope and catalog_intent
 
@@ -168,13 +172,21 @@ def select_papers_for_synthesis(user_text: str, papers: list, limit: int = 20) -
     wants_summary = any(marker in text for marker in _SUMMARY_MARKERS)
     wants_comparison = any(marker in text for marker in _COMPARISON_MARKERS)
     wants_evidence_answer = any(marker in text for marker in _EVIDENCE_ANSWER_MARKERS)
+    cross_paper_scope = bool(
+        len(_explicit_titles(text)) >= 2
+        or re.search(
+            r"(?:两|多|几|这些|那些|本地|全部|所有)\s*(?:篇)?(?:论文|文献)|"
+            r"(?:论文|文献)(?:之间|对比|比较)|这两篇|上述两篇",
+            text,
+        )
+    )
     if not (wants_summary or wants_comparison or wants_evidence_answer):
         return [], ""
 
     selected = select_referenced_papers(text, papers, limit)
     if not selected:
         return [], ""
-    if wants_comparison and len(selected) >= 2:
+    if wants_comparison and cross_paper_scope:
         return selected, "comparison"
     if wants_summary:
         return selected, "partial_summary" if wants_comparison else "summary"
@@ -185,6 +197,26 @@ def select_papers_for_synthesis(user_text: str, papers: list, limit: int = 20) -
 
 def _normalized_title(value: str) -> str:
     return re.sub(r"[^a-z0-9\u4e00-\u9fff]+", "", str(value or "").casefold())
+
+
+def paper_title_matches(requested: str, actual: str) -> bool:
+    """允许唯一的正式标题前缀别名，但禁止任意包含或语义近似替代。"""
+    requested_normalized = _normalized_title(requested)
+    actual_normalized = _normalized_title(actual)
+    if not requested_normalized or not actual_normalized:
+        return False
+    if requested_normalized == actual_normalized:
+        return True
+
+    requested_words = re.findall(r"[a-z0-9]+", str(requested or "").casefold())
+    actual_words = re.findall(r"[a-z0-9]+", str(actual or "").casefold())
+    if len(requested_words) >= 2 and actual_words[:len(requested_words)] == requested_words:
+        return True
+    return (
+        not requested_words
+        and len(requested_normalized) >= 6
+        and actual_normalized.startswith(requested_normalized)
+    )
 
 
 def _explicit_titles(user_text: str) -> list[str]:
@@ -227,12 +259,13 @@ def evaluate_evidence_gate(user_text: str, papers: list, limit: int = 20) -> Evi
     catalog_request = is_local_catalog_request(text)
     wants_comparison = any(marker in text for marker in _COMPARISON_MARKERS)
 
-    available_titles = {_normalized_title(getattr(paper, "title", "")) for paper in selected}
     for title in _explicit_titles(text):
-        if _normalized_title(title) not in available_titles:
+        if not any(paper_title_matches(title, getattr(paper, "title", "")) for paper in selected):
             reasons.append(f"点名论文《{title}》未被精确命中，不能用相关论文替代。")
 
-    if wants_comparison:
+    # “比较自注意力与循环层复杂度”可能是单篇论文内部比较；只有已经判定为
+    # 跨论文 comparison 模式时，才强制要求两篇论文和两个来源。
+    if wants_comparison and mode == "comparison":
         unique_titles = {_normalized_title(getattr(paper, "title", "")) for paper in selected}
         unique_sources = {_clean_text(getattr(paper, "source", "")).casefold() for paper in selected}
         unique_titles.discard("")

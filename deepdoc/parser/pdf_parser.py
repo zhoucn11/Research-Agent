@@ -37,16 +37,8 @@ from pypdf import PdfReader as pdf2_read
 from sklearn.cluster import KMeans
 from sklearn.metrics import silhouette_score
 
+from deepdoc.paths import get_deepdoc_model_directory
 from deepdoc.vision import OCR, AscendLayoutRecognizer, LayoutRecognizer, Recognizer, TableStructureRecognizer
-def get_project_base_directory():
-    return os.environ.get("DEEPDOC_PROJECT_ROOT", r"/root/autodl-tmp/financial-report-rag")
-
-
-def get_deepdoc_model_directory():
-    return os.environ.get(
-        "DEEPDOC_MODEL_DIR",
-        os.path.join(get_project_base_directory(), "rag", "res", "deepdoc"),
-    )
 
 class MockSettings:
     PARALLEL_DEVICES = 0

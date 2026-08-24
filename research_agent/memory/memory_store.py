@@ -1,5 +1,6 @@
 import json
 import os
+import re
 import sqlite3
 import uuid
 from datetime import datetime
@@ -284,42 +285,91 @@ def profile_to_text(profile: dict) -> str:
         ("research_interests", "Research interests"),
         ("output_preferences", "Output preferences"),
     ]:
-        values = profile.get(key) or []
+        values = [
+            value for value in (profile.get(key) or [])
+            if _is_allowed_profile_entry(key, value)
+        ]
         if values:
             parts.append(label + ": " + "; ".join(values[-8:]))
     return "\n".join(parts)
 
 
-def _append_unique(profile: dict, key: str, value: str, limit: int = 30) -> None:
+_DURABLE_PROFILE_MARKERS = (
+    "以后", "下次", "记住", "长期", "总是", "每次", "默认", "我喜欢", "我偏好", "我希望",
+)
+_PRESENTATION_MARKERS = (
+    "中文", "英文", "语言", "简洁", "详细", "正式", "口语", "风格", "格式", "表格", "列表",
+    "markdown", "字数", "句话", "篇幅", "排版", "引用格式",
+)
+
+
+def _is_explicit_research_interest(value: str) -> bool:
+    return bool(re.search(
+        r"我(?:主要|长期)?(?:研究|关注)|我的(?:研究)?方向|我的课题|"
+        r"my research|research interest|research topic",
+        str(value or ""),
+        re.IGNORECASE,
+    ))
+
+
+def _is_durable_presentation_preference(value: str) -> bool:
+    text = str(value or "")
+    lowered = text.casefold()
+    return (
+        any(marker in text for marker in _DURABLE_PROFILE_MARKERS)
+        and any(marker in lowered for marker in _PRESENTATION_MARKERS)
+    )
+
+
+def _is_allowed_profile_entry(key: str, value: str) -> bool:
+    if key == "research_interests":
+        return _is_explicit_research_interest(value)
+    return _is_durable_presentation_preference(value)
+
+
+def is_persistable_user_profile_message(value: str) -> bool:
+    """长期画像只接收显式研究兴趣或持久化的表达偏好。"""
+    return _is_durable_presentation_preference(value) or _is_explicit_research_interest(value)
+
+
+def _append_unique(profile: dict, key: str, value: str, limit: int = 30) -> bool:
     value = value.strip()
     if not value:
-        return
+        return False
     values = profile.setdefault(key, [])
     if value not in values:
         values.append(value)
+        changed = True
+    else:
+        changed = False
     del values[:-limit]
+    return changed
 
 
 def update_user_profile_from_turn(user_message: str, assistant_message: str, user_id: str = DEFAULT_USER_ID) -> dict:
     profile = get_user_profile(user_id)
     text = user_message.strip()
-    lowered = text.lower()
 
     session_scoped_markers = ["本会话", "当前会话", "这轮对话", "这个会话", "这次对话", "这一轮"]
     if any(marker in text for marker in session_scoped_markers):
         return profile
 
-    preference_markers = ["以后", "下次", "记住", "我喜欢", "我希望", "回答时", "风格", "格式", "不要"]
-    if any(marker in text for marker in preference_markers):
-        _append_unique(profile, "preferences", text[:240])
+    changed = False
+    for key in ("preferences", "research_interests", "output_preferences"):
+        values = profile.get(key) or []
+        filtered = [value for value in values if _is_allowed_profile_entry(key, value)]
+        if filtered != values:
+            profile[key] = filtered
+            changed = True
 
-    interest_markers = ["我主要研究", "我关注", "方向", "课题", "topic", "research"]
-    if any(marker in text for marker in interest_markers) or any(k in lowered for k in ["rag", "agent", "mcp"]):
-        _append_unique(profile, "research_interests", text[:180])
+    if _is_durable_presentation_preference(text):
+        changed = _append_unique(profile, "preferences", text[:240]) or changed
+        changed = _append_unique(profile, "output_preferences", text[:180]) or changed
+    if _is_explicit_research_interest(text):
+        changed = _append_unique(profile, "research_interests", text[:180]) or changed
 
-    output_markers = ["表格", "markdown", "简历", "面试", "综述", "对比", "列表"]
-    if any(marker in text for marker in output_markers):
-        _append_unique(profile, "output_preferences", text[:180])
+    if not changed:
+        return profile
 
     now = _now()
     with _connect() as conn:

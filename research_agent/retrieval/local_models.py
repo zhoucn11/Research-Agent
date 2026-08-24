@@ -22,7 +22,7 @@ def get_embeddings():
             _GLOBAL_EMBEDDINGS = HuggingFaceEmbeddings(
                 model_name=os.environ.get(
                     "EMBEDDING_MODEL_PATH",
-                    "/root/autodl-tmp/financial-report-rag/models/bge-large-zh-v1.5",
+                    "BAAI/bge-large-zh-v1.5",
                 ),
                 model_kwargs={"device": "cuda"},
                 encode_kwargs={"batch_size": 1, "normalize_embeddings": True},
@@ -43,7 +43,7 @@ def get_reranker():
             model = HuggingFaceCrossEncoder(
                 model_name=os.environ.get(
                     "RERANKER_MODEL_PATH",
-                    "/root/autodl-tmp/financial-report-rag/models/bge-reranker-v2-m3",
+                    "BAAI/bge-reranker-v2-m3",
                 ),
                 model_kwargs={"device": os.environ.get("RERANKER_DEVICE", "cpu")},
             )

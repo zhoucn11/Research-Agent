@@ -25,17 +25,9 @@ import cv2
 import numpy as np
 from huggingface_hub import snapshot_download
 
+from deepdoc.paths import get_deepdoc_model_directory
 from deepdoc.vision import Recognizer
 from deepdoc.vision.operators import nms
-def get_project_base_directory():
-    return os.environ.get("DEEPDOC_PROJECT_ROOT", r"/root/autodl-tmp/financial-report-rag")
-
-
-def get_deepdoc_model_directory():
-    return os.environ.get(
-        "DEEPDOC_MODEL_DIR",
-        os.path.join(get_project_base_directory(), "rag", "res", "deepdoc"),
-    )
 class MockSettings:
     PARALLEL_DEVICES = 0
 settings = MockSettings()
@@ -267,7 +259,7 @@ class AscendLayoutRecognizer(Recognizer):
     def __init__(self, domain):
         from ais_bench.infer.interface import InferSession
 
-        model_dir = os.path.join(get_project_base_directory(), "rag/res/deepdoc")
+        model_dir = get_deepdoc_model_directory()
         model_file_path = os.path.join(model_dir, domain + ".om")
 
         if not os.path.exists(model_file_path):

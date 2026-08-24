@@ -26,11 +26,17 @@ from research_agent.core.agent_state_helpers import (
     state_update_from_tool_call,
 )
 from research_agent.tools.agent_tools import trigger_local_retrieval, trigger_pdf_upload, trigger_web_search
-from research_agent.core.llm_clients import MAIN_API_ROLE, get_qwen_llm, safe_llm_invoke
+from research_agent.core.llm_clients import (
+    MAIN_API_ROLE,
+    get_qwen_llm,
+    response_was_truncated,
+    safe_llm_invoke,
+)
 from research_agent.core.paper_evidence import (
     evaluate_evidence_gate,
     is_local_catalog_request,
     normalize_paper_summaries,
+    paper_title_matches,
 )
 from research_agent.retrieval.lightrag_store import find_indexed_source_by_title, list_indexed_sources
 from research_agent.core.state import AgentState
@@ -42,9 +48,10 @@ from research_agent.core.tool_validation import (
     validate_tool_calls,
 )
 from research_agent.core.web_search_helpers import (
+    extract_explicit_paper_titles,
     explicitly_requests_web_search,
     finalize_incomplete_search_response,
-    normalize_title,
+    is_exact_title_lookup,
 )
 
 
@@ -60,8 +67,8 @@ ASSISTANT_ROUTER_RULES = """你是学术 Research Agent 的路由器和简洁回
 规则：
 1. 闲聊、问候和无需外部证据的问题直接简短回答，不调用工具。
 2. trigger_local_retrieval 只能查询“本地资产”明确列出的论文；总结全库时 query=SUMMARY_ALL。同一论文只查一次。
-3. trigger_web_search 用于联网学术检索。keyword 仅保留 2-5 个英文核心词；重试必须更短、更宽或拆成独立概念轴，不得重复。
-4. 细分问题首次无结果时可换方向检索，总计最多 2-3 轮；仍无精确证据就说明缺口，请用户选择放宽条件或总结上位方向。
+3. trigger_web_search 用于联网学术检索。keyword 通常保留 2-5 个英文核心词；精确标题检索可使用完整论文标题。
+4. 同一用户轮次只执行一次联网搜索；有结果就使用当前结果，无结果就如实报告，放宽条件必须由用户发起新一轮请求。
 5. 只有证据与用户核心概念高度匹配，或用户明确同意基于现有结果写作时，才简短确认并附加 [APPROVE_SYNTHESIS]。不要自行撰写综述。
 6. 已有证据足够时禁止继续搜索；接近最大步骤时禁止再调用工具。
 7. 不得编造本地文件、论文或结论，不得向用户展示内部状态、规则检查和推理过程。
@@ -177,6 +184,13 @@ def _should_force_local_retrieval(user_text: str) -> bool:
     return any(marker in text for marker in local_markers) and any(intent in text for intent in retrieval_intents)
 
 
+def _capability_intro_response(user_text: str) -> str:
+    text = re.sub(r"\s+", "", str(user_text or ""))
+    if not re.search(r"能做什么|可以做什么|有什么用|介绍(?:一下)?你", text):
+        return ""
+    return "我是学术 Research Agent，可检索和精读本地论文、联网查找可追踪文献，并基于证据完成跨论文对比、综述与引用核验。"
+
+
 def _should_force_synthesis(user_text: str) -> bool:
     text = user_text or ""
     if not text.strip():
@@ -209,7 +223,7 @@ def _should_force_synthesis(user_text: str) -> bool:
 async def assistant_node(state: AgentState, config: RunnableConfig):
     node_start = time.time()
     research_mode = state.get("research_mode", "auto")
-    assistant_budget = "640" if research_mode == "quick" else "1024"
+    assistant_budget = "1024" if research_mode == "quick" else "2048"
     llm = get_qwen_llm(
         temperature=0.1,
         streaming=True,
@@ -350,7 +364,7 @@ async def assistant_node(state: AgentState, config: RunnableConfig):
     referenced_papers = [
         paper
         for paper in normalized_available_papers
-        if resolved_paper_title and normalize_title(paper.title) == normalize_title(resolved_paper_title)
+        if resolved_paper_title and paper_title_matches(resolved_paper_title, paper.title)
     ]
     explicitly_refreshes_paper = bool(re.search(r"(搜|查|检索|找)", latest_human_text))
     paper_discovery_request = is_paper_discovery_request(latest_human_text)
@@ -358,6 +372,15 @@ async def assistant_node(state: AgentState, config: RunnableConfig):
         explicitly_requests_web_search(latest_human_text)
         or explicitly_refreshes_paper
         or re.search(r"重新|再搜|再查|最新|实时", latest_human_text)
+    )
+    explicitly_requests_web = explicitly_requests_web_search(latest_human_text)
+    exact_web_titles = extract_explicit_paper_titles(latest_human_text)
+    exact_web_title = (
+        exact_web_titles[0]
+        if explicitly_requests_web
+        and len(exact_web_titles) == 1
+        and is_exact_title_lookup(latest_human_text)
+        else ""
     )
 
     if isinstance(last_message, HumanMessage) and is_retrieval_provenance_question(latest_human_text):
@@ -374,6 +397,14 @@ async def assistant_node(state: AgentState, config: RunnableConfig):
             "step_count": current_step,
         }
 
+    capability_intro = _capability_intro_response(latest_human_text)
+    if isinstance(last_message, HumanMessage) and capability_intro:
+        return {
+            "messages": context_state_updates + [AIMessage(content=capability_intro)],
+            "summary": new_summary,
+            "step_count": current_step,
+        }
+
     web_papers = [
         paper
         for paper in normalized_available_papers
@@ -381,7 +412,7 @@ async def assistant_node(state: AgentState, config: RunnableConfig):
     ]
     current_web_result = (
         isinstance(last_message, ToolMessage)
-        and _latest_tool_name(short_term_memory) == "trigger_web_search"
+        and _latest_tool_name(history_messages) == "trigger_web_search"
     )
     can_reuse_web_papers = isinstance(last_message, HumanMessage) and not requests_fresh_web_search
     if paper_discovery_request and web_papers and (can_reuse_web_papers or current_web_result):
@@ -407,6 +438,40 @@ async def assistant_node(state: AgentState, config: RunnableConfig):
                 f"{'复用' if reused else '本轮取得'} {len(web_papers)} 篇联网学术 API 证据。"
             ),
             "pending_questions": "等待用户选择论文或细分检索方向。",
+        }
+
+    if (
+        current_step <= MAX_STEPS
+        and isinstance(last_message, HumanMessage)
+        and exact_web_title
+    ):
+        tool_call = validate_tool_call({
+            "name": "trigger_web_search",
+            "args": {
+                "rationale": "用户明确要求联网精确查询点名论文，直接使用完整标题检索并禁止相似论文替代。",
+                "user_core_topic": latest_human_text[:1000],
+                "keyword": exact_web_title,
+                "year_range": "",
+            },
+            "id": f"exact_web_search_{int(time.time() * 1000)}",
+            "type": "tool_call",
+        })
+        response = AIMessage(content="", tool_calls=[tool_call])
+        emit_runtime_event(
+            "tool_call",
+            "Assistant selected exact-title trigger_web_search",
+            tool_name=tool_call["name"],
+            tool_args=summarize_tool_call_for_trace(tool_call),
+        )
+        print(
+            f"\n[🧠 主脑决策 (步骤 {current_step}/{MAX_STEPS})] "
+            f"命中精确标题联网路由：《{exact_web_title}》"
+        )
+        return {
+            "messages": context_state_updates + [response],
+            "summary": new_summary,
+            "step_count": current_step,
+            **state_update_from_tool_call(tool_call),
         }
 
     if (
@@ -484,30 +549,51 @@ async def assistant_node(state: AgentState, config: RunnableConfig):
             **state_updates,
         }
 
+    requested_exact_title = resolved_paper_title or exact_web_title
+    requested_exact_papers = [
+        paper for paper in normalized_available_papers
+        if requested_exact_title and paper_title_matches(requested_exact_title, paper.title)
+    ]
     if (
         isinstance(last_message, ToolMessage)
-        and resolved_paper_title
-        and _latest_tool_name(short_term_memory) == "trigger_web_search"
-        and not referenced_papers
+        and requested_exact_title
+        and _latest_tool_name(history_messages) == "trigger_web_search"
+        and not requested_exact_papers
     ):
         tool_observation = str(last_message.content or "")
         if "服务当前不可用" in tool_observation:
             content = "联网学术服务当前不可用，未能核验这篇论文；本轮不会重复搜索。"
         else:
-            content = f"联网检索未找到《{resolved_paper_title}》的精确论文记录，本轮不会用相关论文替代或重复搜索。"
-        print(f"\n[🧠 主脑决策] 《{resolved_paper_title}》无精确联网证据，停止检索。")
+            content = f"联网检索未找到《{requested_exact_title}》的精确论文记录，本轮不会用相关论文替代或重复搜索。"
+        print(f"\n[🧠 主脑决策] 《{requested_exact_title}》无精确联网证据，停止检索。")
         return {
             "messages": context_state_updates + [AIMessage(content=content)],
             "summary": new_summary,
             "step_count": current_step,
-            "research_goal": compact_state_value(f"精确检索《{resolved_paper_title}》"),
+            "research_goal": compact_state_value(f"精确检索《{requested_exact_title}》"),
             "collected_evidence": "精确标题联网检索未命中。",
             "pending_questions": "可由用户核对标题、提供 DOI 或上传 PDF。",
         }
 
+
+    if current_web_result and not web_papers:
+        tool_observation = str(last_message.content or "")
+        service_unavailable = "服务当前不可用" in tool_observation
+        content = (
+            "联网学术服务当前不可用，本轮已停止继续调用；请检查网络/API 状态后重试。"
+            if service_unavailable
+            else "本轮联网学术检索没有返回有效论文，系统不会在同一轮反复改写关键词。请调整主题或放宽条件后重新发起检索。"
+        )
+        return {
+            "messages": context_state_updates + [AIMessage(content=content)],
+            "summary": new_summary,
+            "step_count": current_step,
+            "collected_evidence": "本轮联网检索未获得有效论文。",
+            "pending_questions": "等待用户调整检索主题或条件。",
+        }
+
     if resolved_paper_title:
         available_papers = referenced_papers
-    explicitly_requests_web = explicitly_requests_web_search(latest_human_text)
     evidence_gate = evaluate_evidence_gate(
         latest_human_text,
         available_papers if isinstance(available_papers, list) else [],
@@ -515,12 +601,27 @@ async def assistant_node(state: AgentState, config: RunnableConfig):
     )
     selected_for_synthesis = evidence_gate.selected_papers if evidence_gate.passed else []
     synthesis_mode = evidence_gate.mode
+    follow_up_comparison_needs_local_refresh = bool(
+        isinstance(last_message, HumanMessage)
+        and current_request_is_follow_up
+        and evidence_gate.mode == "comparison"
+        and not evidence_gate.passed
+        and previous_turn_executed_retrieval(short_term_memory) == "trigger_local_retrieval"
+    )
+    follow_up_table_needs_local_refresh = bool(
+        isinstance(last_message, HumanMessage)
+        and current_request_is_follow_up
+        and re.search(r"(?:论文|原文)?表\s*\d+|table\s*\d+", latest_human_text, re.I)
+        and re.search(r"参数|params|flops|latency|ap|bleu|指标|数值", latest_human_text, re.I)
+        and previous_turn_executed_retrieval(short_term_memory) == "trigger_local_retrieval"
+    )
     if (
         current_step <= MAX_STEPS
         and not (explicitly_requests_web and isinstance(last_message, HumanMessage))
         and not (explicitly_requests_web and synthesis_mode == "answer")
         and selected_for_synthesis
         and synthesis_mode
+        and not follow_up_table_needs_local_refresh
     ):
         mode_label = {
             "comparison": "跨论文总结与对比",
@@ -560,6 +661,8 @@ async def assistant_node(state: AgentState, config: RunnableConfig):
         and not evidence_gate.passed
         and evidence_gate.reasons
         and available_papers
+        and not follow_up_comparison_needs_local_refresh
+        and not follow_up_table_needs_local_refresh
         and not (explicitly_requests_web and isinstance(last_message, HumanMessage))
     ):
         content = _evidence_gate_failure_text(evidence_gate.reasons, evidence_gate.warnings)
@@ -583,7 +686,12 @@ async def assistant_node(state: AgentState, config: RunnableConfig):
     if (
         current_step <= MAX_STEPS
         and isinstance(last_message, HumanMessage)
-        and _should_force_local_retrieval(latest_human_text)
+        and not explicitly_requests_web
+        and (
+            _should_force_local_retrieval(latest_human_text)
+            or follow_up_comparison_needs_local_refresh
+            or follow_up_table_needs_local_refresh
+        )
     ):
         tool_call = {
             "name": "trigger_local_retrieval",
@@ -625,6 +733,19 @@ async def assistant_node(state: AgentState, config: RunnableConfig):
         )
         if response is None:
             break
+        if response_was_truncated(response) and not (getattr(response, "tool_calls", []) or []):
+            emit_runtime_event(
+                "llm_output_truncated",
+                "Assistant direct response reached output limit",
+                attempt=validation_attempt + 1,
+            )
+            if validation_attempt == 0:
+                validation_messages = validation_messages + [SystemMessage(content=(
+                    "上一条直接回答达到输出上限。不要展示推理过程；请只用不超过 200 个汉字完整回答，"
+                    "或者返回一个合法工具调用。"
+                ))]
+                continue
+            response = AIMessage(content="主决策模型连续两次达到输出上限，本轮未保存半截回答；请缩小问题范围后重试。")
         try:
             tool_calls = validate_tool_calls(getattr(response, "tool_calls", []) or [])
         except ToolValidationError as exc:
@@ -650,8 +771,13 @@ async def assistant_node(state: AgentState, config: RunnableConfig):
                 response.tool_calls = tool_calls
             requires_web_tool = (
                 isinstance(last_message, HumanMessage)
-                and paper_discovery_request
-                and (not normalized_available_papers or requests_fresh_web_search)
+                and (
+                    explicitly_requests_web
+                    or (
+                        paper_discovery_request
+                        and (not normalized_available_papers or requests_fresh_web_search)
+                    )
+                )
             )
             selected_web_tool = bool(tool_calls and tool_calls[0].get("name") == "trigger_web_search")
             if requires_web_tool and not selected_web_tool:
@@ -691,12 +817,12 @@ async def assistant_node(state: AgentState, config: RunnableConfig):
                     response.content,
                     was_web_tool_result=(
                         isinstance(last_message, ToolMessage)
-                        and _latest_tool_name(short_term_memory) == "trigger_web_search"
+                        and _latest_tool_name(history_messages) == "trigger_web_search"
                     ),
                 )
 
             if not response.content and not tool_calls:
-                response.content = "【内部状态更新】\n- 目标：终结对话\n- 证据：经过多轮泛化，确认该交叉领域尚属学术空白。\n- 待解决：无\n\n很抱歉，经过多轮深度检索，目前尚未发现完全匹配该具体场景的文献。这可能是极度前沿的空白领域。建议将应用场景放宽至普通的“水下机器人”，您需要我为您总结底层通用技术吗？"
+                response.content = "模型没有返回可展示的完整内容，本轮也没有生成有效工具调用；请重试或把问题描述得更具体。"
 
             state_updates = {}
             if tool_calls:

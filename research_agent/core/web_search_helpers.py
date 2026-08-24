@@ -42,15 +42,39 @@ def is_exact_title_lookup(user_text: str) -> bool:
     text = str(user_text or "")
     if not extract_explicit_paper_titles(text):
         return False
-    return not any(marker in text for marker in ("相关", "相似", "类似", "对比", "比较", "区别", "差异", "异同"))
+    intent_text = re.sub(
+        r"(?:不要|不得|禁止|不能|不应).{0,8}(?:替换|使用|返回|扩展).{0,8}(?:相关|相似|类似)(?:论文|文献)?",
+        "",
+        text,
+    )
+    intent_text = re.sub(
+        r"(?:不要|不得|禁止|不能|不应).{0,8}(?:相关|相似|类似)(?:论文|文献)?.{0,8}(?:替代|替换|冒充)",
+        "",
+        intent_text,
+    )
+    return not any(marker in intent_text for marker in ("相关", "相似", "类似", "对比", "比较", "区别", "差异", "异同"))
 
 
 def select_exact_title_record(papers: list[dict], title: str) -> dict | None:
     target = normalize_title(title)
-    for paper in papers or []:
-        if normalize_title(paper.get("title", "")) == target:
-            return paper
-    return None
+    matches = [
+        paper for paper in papers or []
+        if normalize_title(paper.get("title", "")) == target
+    ]
+    if not matches:
+        return None
+
+    def canonical_score(paper: dict) -> tuple[int, int]:
+        try:
+            citations = int(paper.get("citationCount") or 0)
+        except (TypeError, ValueError):
+            citations = 0
+        external_ids = paper.get("externalIds") or {}
+        id_count = len([value for value in external_ids.values() if value]) if isinstance(external_ids, dict) else 0
+        return citations, id_count
+
+    # 学术 API 可能同时返回同名复刻或错误年份记录；优先采用引用量最高且标识最完整的规范记录。
+    return max(matches, key=canonical_score)
 
 
 def rank_papers_by_query(papers: list[dict], keyword: str) -> list[dict]:
@@ -86,6 +110,12 @@ def select_named_anchor_papers(state: dict, user_core_topic: str) -> list:
 def explicitly_requests_web_search(user_text: str) -> bool:
     """显式联网要求优先于已有证据门控，避免拿上一轮本地论文直接作答。"""
     text = str(user_text or "").casefold()
+    # “不要联网/无需上网”是对联网的否定约束，不能因为包含“联网”二字反向触发 Web Tool。
+    text = re.sub(
+        r"(?:不要|不再|不必|无需|禁止|别|不)\s*(?:上网|联网|全网|外网|网络搜索|web search|online search)",
+        "",
+        text,
+    )
     return any(
         marker in text
         for marker in ("网上", "联网", "全网", "外网", "网络文献", "web search", "online search")

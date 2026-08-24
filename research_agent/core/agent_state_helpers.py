@@ -5,8 +5,9 @@ import re
 
 _FOLLOW_UP_PATTERN = re.compile(
     r"(第\s*[0-9一二三四五六七八九十]+\s*[篇个]|最后|上一|下一|刚才|前面|上述|前述|那个|这个|"
-    r"这篇|那篇|这些|那些|他们|它们|这几篇|那几篇|两篇|几篇|详细说|展开说|"
-    r"那你先|那就先|那先|先总结|先对比|先说已有|先给已有)"
+    r"上轮|上面|这篇|那篇|这些|那些|他们|它们|这几篇|那几篇|两篇|几篇|详细说|展开说|"
+    r"那你先|那就先|那先|先总结|先对比|先说已有|先给已有|"
+    r"从(?:论文|原文)表\s*\d+|(?:论文|原文)表\s*\d+)"
 )
 
 _SINGULAR_PAPER_REFERENCE_PATTERN = re.compile(r"(这篇(?:论文|文章|文献)?|那篇(?:论文|文章|文献)?|该(?:论文|文章|文献))")
@@ -94,7 +95,7 @@ def _title_score(title: str) -> tuple[int, int]:
     return len(english_words), len(title)
 
 
-def _mentioned_titles(text: str, known_titles: list[str]) -> list[str]:
+def _mentioned_titles(text: str, known_titles: list[str], *, include_quoted: bool = True) -> list[str]:
     content = str(text or "")
     compact_content = re.sub(r"[^a-z0-9\u4e00-\u9fff]+", "", content.casefold())
     titles = []
@@ -102,6 +103,8 @@ def _mentioned_titles(text: str, known_titles: list[str]) -> list[str]:
         compact_title = re.sub(r"[^a-z0-9\u4e00-\u9fff]+", "", str(title or "").casefold())
         if len(compact_title) >= 6 and compact_title in compact_content:
             titles.append(str(title).strip())
+    if titles or not include_quoted:
+        return list(dict.fromkeys(titles))
     for pattern in _QUOTED_TITLE_PATTERNS:
         titles.extend(match.strip() for match in pattern.findall(content) if match.strip())
     return list(dict.fromkeys(titles))
@@ -114,6 +117,7 @@ def resolve_follow_up_paper_title(messages: list, user_text: str, known_titles: 
 
     known_titles = [str(title).strip() for title in (known_titles or []) if str(title).strip()]
     skipped_current_human = False
+    prior_messages = []
     for message in reversed(messages or []):
         content = str(getattr(message, "content", "") or "")
         message_type = str(getattr(message, "type", "") or "").lower()
@@ -121,7 +125,33 @@ def resolve_follow_up_paper_title(messages: list, user_text: str, known_titles: 
             if message_type == "human" and content == str(user_text or ""):
                 skipped_current_human = True
             continue
-        candidates = _mentioned_titles(content, known_titles)
+        prior_messages.append((message_type, content))
+
+    # 单数指代优先绑定用户上一轮明确写出的《论文标题》。Assistant 回答中的引号
+    # 往往只是证据原句或模块名，不能抢在用户给出的目标之前被当成新论文。
+    for message_type, content in prior_messages:
+        if message_type != "human":
+            continue
+        explicit_titles = [
+            match.strip()
+            for match in _QUOTED_TITLE_PATTERNS[0].findall(content)
+            if match.strip()
+        ]
+        if explicit_titles:
+            return max(explicit_titles, key=_title_score)
+
+    for _, content in prior_messages:
+        candidates = _mentioned_titles(content, known_titles, include_quoted=False)
+        if candidates:
+            return max(candidates, key=_title_score)
+    # 上下文压缩可能已经移除最早那条显式标题，但当前证据状态仍能唯一确定论文。
+    # 此时直接绑定唯一候选，禁止从回答中的引号片段猜测一个新标题并错误转向联网。
+    if len(known_titles) == 1:
+        return known_titles[0]
+    # 候选标题在历史中完全没有出现时，才允许从自然语言里的引号恢复一篇新论文。
+    # 这样既支持“YOLO 开山之作”追问，也不会让最近回答中的带引号结论覆盖既有论文。
+    for _, content in prior_messages:
+        candidates = _mentioned_titles(content, [], include_quoted=True)
         if candidates:
             return max(candidates, key=_title_score)
     return ""
@@ -138,6 +168,11 @@ def paper_title_search_keyword(title: str) -> str:
 def _exact_web_title_goal(args: dict) -> str:
     topic = str((args or {}).get("user_core_topic", "") or "")
     lowered = topic.casefold()
+    lowered = re.sub(
+        r"(?:不要|不得|禁止|不能|不应).{0,8}(?:替换|使用|返回|扩展).{0,8}(?:相关|相似|类似)(?:论文|文献)?",
+        "",
+        lowered,
+    )
     if any(marker in lowered for marker in ("相关", "相似", "类似", "对比", "比较", "区别", "差异", "related", "similar", "compare")):
         return ""
     titles = []

@@ -19,17 +19,8 @@ import copy
 import time
 import os
 
-# --- 你自己补上的路径函数 ---
-def get_project_base_directory():
-    return os.environ.get("DEEPDOC_PROJECT_ROOT", r"/root/autodl-tmp/financial-report-rag")
+from deepdoc.paths import get_deepdoc_model_directory
 
-
-def get_deepdoc_model_directory():
-    return os.environ.get(
-        "DEEPDOC_MODEL_DIR",
-        os.path.join(get_project_base_directory(), "rag", "res", "deepdoc"),
-    )
-# -----------------------------
 from huggingface_hub import snapshot_download
 
 class MockSettings:

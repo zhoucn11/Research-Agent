@@ -1,10 +1,10 @@
 import asyncio
-import difflib
 import glob
 import os
 import re
 import time
 
+from json_repair import repair_json
 from langchain_core.messages import HumanMessage, SystemMessage, ToolMessage
 from langchain_core.documents import Document
 from pydantic import BaseModel, Field
@@ -20,7 +20,7 @@ from research_agent.core.paper_evidence import (
 from research_agent.core.state import AgentState
 from research_agent.core.runtime_events import emit_runtime_event, instrument_node, runtime_print as print
 from research_agent.core.tool_validation import ToolValidationError, validate_tool_call
-from research_agent.core.web_search_helpers import extract_explicit_paper_titles
+from research_agent.core.web_search_helpers import extract_explicit_paper_titles, normalize_title
 from research_agent.retrieval.academic_search import verify_metadata_online
 from research_agent.retrieval.lightrag_store import (
     find_indexed_source_by_title,
@@ -54,6 +54,69 @@ class PaperSummaryBatch(BaseModel):
     papers: list[ExtractedPaperSummary] = Field(default_factory=list, max_length=8)
 
 
+_EXTRACTED_FIELD_LIMITS = {
+    "title": 240,
+    "authors": 600,
+    "year": 40,
+    "source": 260,
+    "core_method": 700,
+    "key_findings": 700,
+}
+
+
+def _parse_paper_summary_batch(response) -> PaperSummaryBatch | None:
+    """解析 include_raw 结构；正常结果优先，失败时只修复原始 JSON 文本。"""
+    parsed = response.get("parsed") if isinstance(response, dict) else response
+    if isinstance(parsed, PaperSummaryBatch):
+        return parsed
+    if parsed is not None:
+        try:
+            return PaperSummaryBatch.model_validate(parsed)
+        except Exception:
+            pass
+
+    raw = response.get("raw") if isinstance(response, dict) else None
+    content = getattr(raw, "content", "") if raw is not None else ""
+    if not isinstance(content, str) or not content.strip():
+        return None
+
+    cleaned = re.sub(r"(?is)<think>.*?</think>", "", content).strip()
+    fenced = re.search(r"(?is)```(?:json)?\s*(.*?)```", cleaned)
+    if fenced:
+        cleaned = fenced.group(1).strip()
+    elif "{" in cleaned:
+        cleaned = cleaned[cleaned.find("{"):]
+
+    try:
+        payload = repair_json(cleaned, return_objects=True)
+    except Exception:
+        return None
+    if isinstance(payload, list):
+        payload = {"papers": payload}
+    if not isinstance(payload, dict) or not isinstance(payload.get("papers"), list):
+        return None
+
+    repaired_papers = []
+    for item in payload["papers"][:8]:
+        if not isinstance(item, dict):
+            continue
+        repaired = {}
+        for field_name, limit in _EXTRACTED_FIELD_LIMITS.items():
+            value = item.get(field_name)
+            if isinstance(value, list):
+                value = ", ".join(str(part) for part in value)
+            elif isinstance(value, dict):
+                value = next(iter(value.values()), "")
+            repaired[field_name] = str(value or "未知").strip()[:limit]
+        repaired_papers.append(repaired)
+    if not repaired_papers:
+        return None
+    try:
+        return PaperSummaryBatch.model_validate({"papers": repaired_papers})
+    except Exception:
+        return None
+
+
 def _is_global_summary(user_query: str, last_human_msg: str) -> bool:
     normalized = (user_query or "").strip()
     return (
@@ -70,6 +133,7 @@ def _resolve_target_sources(
     user_query: str,
     last_human_msg: str,
     indexed_sources: list[str],
+    inherited_sources: list[str],
     tool_name: str,
 ) -> tuple[list[str], bool]:
     if routed_paths:
@@ -81,12 +145,32 @@ def _resolve_target_sources(
         return indexed_sources, True
 
     resolved_sources = []
-    for title in extract_explicit_paper_titles(user_query):
+    request_text = "\n".join(part for part in (user_query, last_human_msg) if part)
+    for title in extract_explicit_paper_titles(request_text):
         source = find_indexed_source_by_title(title)
         if source in indexed_sources and source not in resolved_sources:
             resolved_sources.append(source)
     if resolved_sources:
         return resolved_sources, False
+
+    # “这两篇/多篇/全部论文”是明确的跨论文范围，不能退化成语义检索命中的单篇。
+    multi_paper_scope = bool(re.search(
+        r"(?:这|那|上述|前述)?(?:两|三|多|几)篇(?:论文|文献)|"
+        r"(?:全部|所有|这些|上述|前述)(?:论文|文献)|跨论文",
+        request_text,
+    ))
+    if multi_paper_scope:
+        inherited = [source for source in inherited_sources if source in indexed_sources]
+        if len(inherited) >= 2:
+            return list(dict.fromkeys(inherited)), False
+        return indexed_sources, False
+
+    inherited = [
+        source for source in inherited_sources
+        if source in indexed_sources
+    ]
+    if inherited:
+        return list(dict.fromkeys(inherited)), False
 
     clean_query = (user_query or "").lower().replace(".pdf", "").strip()
     exact = [source for source in indexed_sources if clean_query and clean_query in source.lower()]
@@ -150,7 +234,7 @@ async def _extract_paper_summaries(
     structured_llm = get_local_llm(
         temperature=0,
         max_tokens=int(os.environ.get("RAG_EXTRACTION_MAX_OUTPUT_TOKENS", "2800")),
-    ).with_structured_output(PaperSummaryBatch, method="json_mode")
+    ).with_structured_output(PaperSummaryBatch, method="json_mode", include_raw=True)
     messages = [
         SystemMessage(content=(
             "你是学术证据抽取器。只能依据给定论文首页身份锚点和 LightRAG 图谱上下文，必须输出严格 JSON。"
@@ -178,9 +262,35 @@ LightRAG 图谱与原文上下文：
         max_retries=1,
         role=LOCAL_ROLE,
     )
-    papers = [PaperSummary(**paper.model_dump()) for paper in batch.papers] if batch else []
+    parsed_batch = _parse_paper_summary_batch(batch)
+    if parsed_batch and isinstance(batch, dict) and batch.get("parsing_error") is not None:
+        print("  └─ 🧩 LightRAG 结构化结果已从原始响应本地修复，无需再次调用模型。")
+        emit_runtime_event(
+            "structured_output_repaired",
+            "LightRAG evidence JSON repaired locally",
+            role=LOCAL_ROLE,
+        )
+    papers = [PaperSummary(**paper.model_dump()) for paper in parsed_batch.papers] if parsed_batch else []
     normalized = _normalize_summary_sources(papers, allowed_sources)
     if normalized:
+        if not target_sources:
+            return normalized
+        covered_sources = {str(paper.source).casefold() for paper in normalized}
+        missing_sources = [
+            source for source in target_sources
+            if source.casefold() not in covered_sources
+        ]
+        if missing_sources:
+            backfilled = _paper_summaries_from_full_docs(missing_sources)
+            if backfilled:
+                print(
+                    f"  └─ 🧾 结构化抽取只覆盖 {len(normalized)}/{len(target_sources)} 个目标来源，"
+                    f"已从入库原文回填 {len(backfilled)} 篇。"
+                )
+                normalized = _normalize_summary_sources(
+                    [*normalized, *backfilled],
+                    target_sources,
+                )
         return normalized
 
     fallback = _paper_summaries_from_full_docs(allowed_sources)
@@ -216,16 +326,16 @@ async def _verify_metadata(results: list[PaperSummary], *, required: bool = True
         online_title = str(info.get("title") or "")
         if not online_title:
             continue
-        similarity = difflib.SequenceMatcher(None, local_title.lower(), online_title.lower()).ratio()
-        if "未知" in local_title or local_title.lower().endswith(".pdf"):
-            paper.title = online_title
-        elif similarity > 0.45 and len(online_title) > len(local_title):
-            paper.title = online_title
-        elif similarity <= 0.45:
-            print(f"  [🛡️ 元数据覆盖拦截] 本地标题与在线标题相似度仅 {similarity:.2f}")
+        # verify_metadata_online 已要求规范化标题完全一致；这里再次守住覆盖边界，
+        # 防止相似论文的作者或年份污染本地论文身份。
+        if normalize_title(local_title) != normalize_title(online_title):
+            print("  [🛡️ 元数据覆盖拦截] 在线标题未与本地标题精确一致")
             continue
-        if str(paper.year) in {"未知", "未知年份"} and info.get("year") not in {None, "未知"}:
-            paper.year = info["year"]
+        paper.title = online_title
+        verified_year = str(info.get("year") or "").strip()
+        if re.fullmatch(r"(?:19|20)\d{2}", verified_year):
+            # 在线记录已精确对题时，以核验年份覆盖本地抽取模型的猜测值。
+            paper.year = verified_year
         online_authors = str(info.get("authors") or "").strip()
         local_authors = str(paper.authors or "").strip()
         if should_replace_author_metadata(local_authors, online_authors):
@@ -241,8 +351,26 @@ async def _attach_page_evidence(
     if not results:
         return
     sources = [str(paper.source) for paper in results if not str(paper.source).startswith("http")]
-    span_limit = max(1, int(os.environ.get("RAG_EVIDENCE_SPANS_PER_SOURCE", "5")))
-    spans_by_source = load_relevant_evidence_spans(sources, query, per_source=span_limit)
+    base_limit = max(1, int(os.environ.get("RAG_EVIDENCE_SPANS_PER_SOURCE", "5")))
+    normalized_query = str(query or "").casefold()
+    detailed_query = bool(re.search(
+        r"总结|综述|概括|介绍|讲一下|详细|核心方法|主要结论|实验结果|"
+        r"summari[sz]e|overview|review|method.*result|method.*conclusion",
+        normalized_query,
+    ))
+    comparison_query = bool(re.search(r"对比|比较|区别|异同|compare|versus|\bvs\b", normalized_query))
+    if len(sources) == 1 and detailed_query:
+        span_limit = max(base_limit, int(os.environ.get("RAG_DETAILED_EVIDENCE_SPANS_PER_SOURCE", "8")))
+    elif len(sources) <= 2 and comparison_query:
+        span_limit = max(base_limit, int(os.environ.get("RAG_COMPARISON_EVIDENCE_SPANS_PER_SOURCE", "6")))
+    else:
+        span_limit = base_limit
+    candidate_multiplier = max(1, int(os.environ.get("RAG_EVIDENCE_CANDIDATE_MULTIPLIER", "2")))
+    spans_by_source = load_relevant_evidence_spans(
+        sources,
+        query,
+        per_source=span_limit * candidate_multiplier,
+    )
 
     if enable_local_rerank and spans_by_source:
         try:
@@ -260,6 +388,10 @@ async def _attach_page_evidence(
     for paper in results:
         spans = spans_by_source.get(str(paper.source), [])[:span_limit]
         paper.evidence_spans = [EvidenceSpan(**span) for span in spans]
+    print(
+        f"  └─ 📎 页级证据预算: 每篇最多 {span_limit} 条，"
+        f"候选池 {span_limit * candidate_multiplier} 条；已按章节/页码去重。"
+    )
 
 
 @instrument_node("rag_map")
@@ -316,11 +448,21 @@ async def rag_map_node(state: AgentState):
             "messages": [ToolMessage(tool_call_id=tool_call["id"], content=message)],
         }
 
+    inherited_sources = []
+    if state.get("is_follow_up"):
+        inherited_papers = normalize_paper_summaries(
+            state.get("candidate_papers") or state.get("selected_papers") or []
+        )
+        inherited_sources = [
+            str(paper.source) for paper in inherited_papers
+            if str(paper.source) in indexed_sources
+        ]
     target_sources, global_summary = _resolve_target_sources(
         routed_paths,
         user_query,
         last_human_msg,
         indexed_sources,
+        inherited_sources,
         tool_name,
     )
 
@@ -495,9 +637,12 @@ async def rag_map_node(state: AgentState):
     if not verify_metadata:
         print("  └─ ⚡ 快速模式未要求元数据字段，跳过关键路径上的联网元数据核验。")
     await _verify_metadata(results, required=verify_metadata)
+    evidence_query = "\n".join(
+        part for part in (last_human_msg.strip(), user_query.strip()) if part
+    )
     await _attach_page_evidence(
         results,
-        user_query or last_human_msg,
+        evidence_query,
         enable_local_rerank=strategy.enable_rerank,
     )
     evidence_span_count = sum(

@@ -65,7 +65,7 @@ def get_synthesis_llm(
 ):
     """综述 Agent 沿用主 Qwen API，只单独配置超时和输出预算。"""
     timeout = int(os.environ.get("SYNTHESIS_TIMEOUT", os.environ.get("LLM_TIMEOUT", 300)))
-    output_limit = max_tokens or int(os.environ.get("SYNTHESIS_MAX_OUTPUT_TOKENS", "4096"))
+    output_limit = max_tokens or int(os.environ.get("SYNTHESIS_MAX_OUTPUT_TOKENS", "8192"))
     return _main_llm(temperature, streaming, output_limit, timeout, thinking_budget)
 
 
@@ -205,6 +205,8 @@ def _record_failure(role: str) -> None:
 
 
 def _usage_fields(response: Any) -> dict:
+    if isinstance(response, dict) and response.get("raw") is not None:
+        response = response["raw"]
     usage = getattr(response, "usage_metadata", None) or {}
     if not usage:
         metadata = getattr(response, "response_metadata", None) or {}
@@ -223,6 +225,27 @@ def _usage_fields(response: Any) -> dict:
     return fields
 
 
+def response_finish_reason(response: Any) -> str:
+    """兼容 LangChain/OpenAI 响应结构，提取服务端的停止原因。"""
+    if isinstance(response, dict) and response.get("raw") is not None:
+        response = response["raw"]
+    metadata = getattr(response, "response_metadata", None) or {}
+    reason = metadata.get("finish_reason") if isinstance(metadata, dict) else None
+    if not reason and isinstance(metadata, dict):
+        choices = metadata.get("choices") or []
+        if choices and isinstance(choices[0], dict):
+            reason = choices[0].get("finish_reason")
+    if not reason:
+        additional = getattr(response, "additional_kwargs", None) or {}
+        reason = additional.get("finish_reason") if isinstance(additional, dict) else None
+    return str(reason or "").strip().casefold()
+
+
+def response_was_truncated(response: Any) -> bool:
+    """HTTP 200 不代表生成完整；length/max_tokens 都视为明确截断。"""
+    return response_finish_reason(response) in {"length", "max_tokens"}
+
+
 async def safe_llm_invoke(
     structured_llm,
     prompt: Union[str, List[Any]],
@@ -231,8 +254,11 @@ async def safe_llm_invoke(
     *,
     role: str = MAIN_API_ROLE,
     invoke_config: dict | None = None,
+    error_sink: list[Exception] | None = None,
 ):
     """统一模型调用策略：角色级限流、分类重试、指数退避和轻量熔断。"""
+    if error_sink is not None:
+        error_sink.clear()
     if _circuit_is_open(role):
         runtime_print(f"  [LLM熔断] {task_name} 跳过调用：{role} 仍在冷却期。")
         emit_runtime_event("llm_circuit_open", f"{task_name} circuit open", role=role)
@@ -250,12 +276,14 @@ async def safe_llm_invoke(
                     response = await structured_llm.ainvoke(prompt, invoke_config)
                 elapsed_ms = round((time.perf_counter() - started_at) * 1000, 2)
                 _record_success(role)
+                finish_reason = response_finish_reason(response)
                 emit_runtime_event(
                     "llm_call_end",
                     f"{task_name} completed",
                     role=role,
                     attempts=attempt + 1,
                     latency_ms=elapsed_ms,
+                    **({"finish_reason": finish_reason} if finish_reason else {}),
                     **_usage_fields(response),
                 )
                 return response
@@ -305,6 +333,8 @@ async def safe_llm_invoke(
                     retryable=retryable,
                     latency_ms=elapsed_ms,
                 )
+                if error_sink is not None:
+                    error_sink.append(exc)
                 return None
     return None
 

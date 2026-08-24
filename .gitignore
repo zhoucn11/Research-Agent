@@ -34,19 +34,13 @@ models/
 *.pth
 *.safetensors
 
-# Personal notes and generated evaluation reports
+# Local development, evaluation and personal notes
 Research Agent*.docx
+指令
 指令.txt
 AGENT_EVAL_RESULTS.json
 AGENT_EVAL_REPORT.md
-
-# Publish only representative regression tests; keep the full local suite locally.
-tests/*
-!tests/test_evaluate_agent.py
-!tests/test_index_jobs.py
-!tests/test_lightrag_manifest.py
-!tests/test_llm_resilience.py
-!tests/test_memory_user_isolation.py
-!tests/test_reviewer_workflow.py
-!tests/test_streaming_utils.py
-!tests/test_tool_validation.py
+tests/
+scripts/
+docs/
+local_notes/

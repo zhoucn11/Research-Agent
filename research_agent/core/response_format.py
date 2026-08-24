@@ -17,7 +17,8 @@ def detect_response_format(user_text: str, memory_text: str = "") -> str:
 
     table_markers = (
         "只给一个对比表", "只给对比表", "只返回表格", "仅返回表格",
-        "只要表格", "仅要表格", "只用表格", "仅用表格",
+        "只要表格", "仅要表格", "只用表格", "仅用表格", "一行Markdown表格",
+        "用表格回答", "使用表格", "Markdown表", "同一张表", "放在同一张表",
     )
     if any(marker in compact for marker in table_markers):
         return "table_only"
@@ -33,7 +34,9 @@ def detect_response_format(user_text: str, memory_text: str = "") -> str:
     if metadata_action and metadata_fields:
         return "metadata_only"
 
-    if any(marker in compact for marker in ("一句话", "简要", "简短", "不要展开", "不展开")):
+    if any(marker in compact for marker in (
+        "一句话", "简要", "简短", "不要展开", "不展开", "只说", "只根据论文回答",
+    )):
         return "brief"
 
     memory = re.sub(r"\s+", "", str(memory_text or ""))

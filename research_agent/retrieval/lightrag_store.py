@@ -115,6 +115,21 @@ def _query_terms(text: str) -> set[str]:
     return terms
 
 
+def _normalized_term_position(text: str, term: str) -> int:
+    """在忽略空格和标点后定位术语，并返回其在原文中的起始位置。"""
+    normalized_term = re.sub(r"[^a-z0-9]+", "", str(term or "").casefold())
+    if len(normalized_term) < 6:
+        return -1
+    normalized_chars = []
+    original_positions = []
+    for index, char in enumerate(str(text or "").casefold()):
+        if char.isascii() and char.isalnum():
+            normalized_chars.append(char)
+            original_positions.append(index)
+    position = "".join(normalized_chars).find(normalized_term)
+    return original_positions[position] if position >= 0 else -1
+
+
 def _load_text_chunk_records(working_dir: Path) -> list[dict]:
     global _TEXT_CHUNK_CACHE
     path = working_dir / "kv_store_text_chunks.json"
@@ -137,8 +152,51 @@ def _load_text_chunk_records(working_dir: Path) -> list[dict]:
     return records
 
 
+def _load_full_doc_contents(working_dir: Path, sources: list[str]) -> dict[str, str]:
+    """读取与 source 对应的原文，仅用于给结构化表格 chunk 恢复真实页码。"""
+    manifest = load_index_manifest(get_manifest_path(working_dir))
+    try:
+        payload = json.loads((working_dir / "kv_store_full_docs.json").read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    result = {}
+    records = manifest.get("documents", {})
+    for source in sources:
+        doc_id = (records.get(source) or {}).get("doc_id")
+        content = str((payload.get(doc_id) or {}).get("content", "")) if doc_id else ""
+        if content:
+            result[source] = content
+    return result
+
+
+def _infer_table_page(content: str, full_doc: str) -> int | None:
+    """用原文中同一 Table 标题附近的真实 [page:N] 标记补齐表格派生 chunk。"""
+    table_match = re.search(r"\bTable\s+(\d+)\b", str(content or ""), re.I)
+    if not table_match or not full_doc:
+        return None
+    original_match = re.search(rf"\bTable\s+{re.escape(table_match.group(1))}\b", full_doc, re.I)
+    if not original_match:
+        return None
+    page_matches = list(re.finditer(r"\[page:(\d+)\]", full_doc[:original_match.start()]))
+    return int(page_matches[-1].group(1)) if page_matches else None
+
+
+def _looks_like_reference_section(content: str) -> bool:
+    lowered = str(content or "").casefold()
+    if re.search(r"(?:^|\n)\s*(?:references|bibliography)\s*(?:\n|$)", lowered):
+        return True
+    citation_count = len(re.findall(r"\[\d{1,3}\]", lowered))
+    publication_markers = len(re.findall(
+        r"\barxiv\b|\bproceedings\b|\bjournal\b|\btransactions\b|\bpress\b|\bconference\b",
+        lowered,
+    ))
+    return citation_count >= 4 and publication_markers >= 2
+
+
 def _infer_section(content: str) -> str:
     lowered = content.casefold()
+    if _looks_like_reference_section(content):
+        return "References"
     for marker, label in (
         ("abstract", "Abstract"),
         ("introduction", "Introduction"),
@@ -153,19 +211,139 @@ def _infer_section(content: str) -> str:
     return "未知章节"
 
 
-def _clean_evidence_quote(content: str, terms: set[str] | None = None, limit: int = 700) -> str:
+def _metric_anchor_position(text: str) -> int | None:
+    """定位带单位的实验指标，避免证据窗口只保留 chunk 开头。"""
+    match = re.search(
+        r"\b\d+(?:\.\d+)?\s*(?:%|ms|milliseconds?|bleu|map|ap(?:50|75)?|flops|fps)"
+        r"(?![a-z0-9_])",
+        text,
+        re.I,
+    )
+    return match.start() if match else None
+
+
+def _clean_evidence_quote(
+    content: str,
+    terms: set[str] | None = None,
+    limit: int = 700,
+    *,
+    prefer_metric: bool = False,
+) -> str:
     text = re.sub(r"(?s)\[PAPER_METADATA\].*?\[/PAPER_METADATA\]", " ", content or "")
     text = re.sub(r"\s*\[page:\d+\]\s*", " ", text)
     text = re.sub(r"\s+", " ", text).strip()
     text = re.sub(r"^:?\d+\]\s*", "", text)
-    positions = [text.casefold().find(term) for term in (terms or set())]
-    positions = [position for position in positions if position >= 0]
-    if positions and len(text) > limit:
-        start = max(0, min(positions) - 180)
+    lowered = text.casefold()
+    metric_position = _metric_anchor_position(text) if prefer_metric else None
+    matched_terms = []
+    for term in (terms or set()):
+        position = lowered.find(term)
+        if position < 0:
+            position = _normalized_term_position(text, term)
+        if position >= 0:
+            matched_terms.append((len(term), position, term))
+    positions = [position for _, position, _ in matched_terms]
+    # 指标问题点名具体模型、模块或表项时，证据窗口必须围绕最长的身份词，
+    # 不能永远截取表格第一行的第一个数字并把其他方法的指标带进答案。
+    identity_match = max(matched_terms, default=None)
+    identity_position = identity_match[1] if identity_match and identity_match[0] >= 6 else None
+    if prefer_metric and identity_position is not None:
+        anchor = identity_position
+    else:
+        anchor = metric_position if metric_position is not None else (min(positions) if positions else None)
+    if anchor is not None and len(text) > limit:
+        start = max(0, anchor - (300 if metric_position is not None else 180))
         text = text[start:start + limit]
         if start:
             text = "…" + text
     return text[:limit].rstrip()
+
+
+def _is_broad_evidence_query(query: str) -> bool:
+    normalized = str(query or "").casefold()
+    return bool(re.search(
+        r"总结|综述|概括|介绍|讲一下|详细|核心方法|主要结论|实验结果|"
+        r"summari[sz]e|overview|review|method.*result|method.*conclusion",
+        normalized,
+    ))
+
+
+def _metric_evidence_bonus(content: str, query: str, *, broad_query: bool) -> float:
+    metric_query = bool(re.search(
+        r"指标|性能|数值|实验|结果|速度|延迟|参数量|复杂度|计算瓶颈|"
+        r"bleu|\bmap\b|\bap(?:50|75)?\b|flops|latency|throughput|accuracy|precision|recall|complexity",
+        str(query or "").casefold(),
+    ))
+    if not broad_query and not metric_query:
+        return 0.0
+    lowered = str(content or "").casefold()
+    marker_count = len(re.findall(
+        r"bleu|\bmap\b|\bap(?:50|75)?\b|flops|latency|throughput|accuracy|precision|recall|"
+        r"parameters?|\bms\b|complexity per layer|maximum path length|state[- ]of[- ]the[- ]art|"
+        r"outperform|wmt|coco",
+        lowered,
+    ))
+    numeric_count = len(re.findall(r"\b\d+(?:\.\d+)?\s*(?:%|ms|bleu)?\b", lowered))
+    if marker_count == 0:
+        return 0.0
+    complexity_focus = bool(
+        re.search(r"复杂度|计算瓶颈|complexity", str(query or "").casefold())
+        and re.search(r"complexity per layer|maximum path length", lowered)
+    )
+    return min(8.0, 1.2 + marker_count * 0.35 + min(numeric_count, 6) * 0.15 + (4.0 if complexity_focus else 0.0))
+
+
+def _select_diverse_evidence_spans(
+    ranked: list[tuple[float, int, dict]],
+    limit: int,
+    *,
+    broad_query: bool,
+) -> list[dict]:
+    """优先覆盖不同章节和页码，再按相关性补齐，避免同页近邻 chunk 挤占证据包。"""
+    selected: list[dict] = []
+    selected_chunks: set[str] = set()
+    selected_quotes: set[str] = set()
+    page_counts: dict[int | None, int] = {}
+
+    def add(item: tuple[float, int, dict], *, max_per_page: int | None = None) -> bool:
+        span = item[2]
+        chunk_id = str(span.get("chunk_id") or "")
+        quote_key = re.sub(r"\W+", "", str(span.get("quote") or "").casefold())[:240]
+        page = span.get("page_start")
+        if chunk_id in selected_chunks or (quote_key and quote_key in selected_quotes):
+            return False
+        if max_per_page is not None and page_counts.get(page, 0) >= max_per_page:
+            return False
+        selected.append(span)
+        selected_chunks.add(chunk_id)
+        if quote_key:
+            selected_quotes.add(quote_key)
+        page_counts[page] = page_counts.get(page, 0) + 1
+        return True
+
+    if broad_query:
+        metric_candidate = next(
+            (item for item in ranked if _metric_anchor_position(str(item[2].get("quote") or "")) is not None),
+            None,
+        )
+        for section in ("Abstract", "Introduction", "Method", "Experiments", "Conclusion"):
+            candidate = next(
+                (item for item in ranked if item[2].get("section") == section),
+                None,
+            )
+            if candidate is not None:
+                add(candidate, max_per_page=1)
+            if section == "Abstract" and metric_candidate is not None:
+                add(metric_candidate)
+            if len(selected) >= limit:
+                return selected
+
+    for max_per_page in (1, 2, None):
+        for item in ranked:
+            add(item, max_per_page=max_per_page)
+            if len(selected) >= limit:
+                return selected
+    return selected
 
 
 def load_relevant_evidence_spans(
@@ -179,6 +357,8 @@ def load_relevant_evidence_spans(
     source_lookup = {os.path.basename(source).casefold(): source for source in sources}
     candidates: dict[str, list[tuple[float, int, dict]]] = {source: [] for source in sources}
     terms = _query_terms(query)
+    broad_query = _is_broad_evidence_query(query)
+    full_docs_by_source = _load_full_doc_contents(base_dir, sources)
 
     for record in _load_text_chunk_records(base_dir):
         raw_source = os.path.basename(str(record.get("file_path") or ""))
@@ -188,21 +368,55 @@ def load_relevant_evidence_spans(
             continue
         lowered = content.casefold()
         lexical_hits = sum(1 for term in terms if term in lowered)
+        identity_terms = {
+            term for term in terms
+            if len(term) >= 6 and term not in {
+                "params", "flops", "latency", "throughput", "accuracy", "precision",
+                "recall", "markdown", "table", "result", "results",
+            }
+        }
+        normalized_identity_hits = sum(
+            1 for term in identity_terms
+            if term not in lowered and _normalized_term_position(content, term) >= 0
+        )
         order = int(record.get("chunk_order_index") or 0)
-        score = float(lexical_hits * 3 + (2 if order == 0 else 1 if order == 1 else 0))
+        section = _infer_section(content)
+        if broad_query and section == "References":
+            continue
+        section_bonus = {
+            "Abstract": 2.0,
+            "Introduction": 1.2,
+            "Method": 2.2,
+            "Experiments": 2.2,
+            "Conclusion": 2.0,
+        }.get(section, 0.0) if broad_query else 0.0
+        metric_bonus = _metric_evidence_bonus(content, query, broad_query=broad_query)
+        score = float(
+            lexical_hits * 3
+            + normalized_identity_hits * 8
+            + (2 if order == 0 else 1 if order == 1 else 0)
+            + section_bonus
+            + (0.25 if broad_query else 0.0)
+            + metric_bonus
+        )
         if score <= 0:
             continue
         pages = [int(value) for value in re.findall(r"\[page:(\d+)\]", content)]
         page_start = min(pages) if pages else None
+        if page_start is None:
+            page_start = _infer_table_page(content, full_docs_by_source.get(source, ""))
         page_end = max(pages) if pages else page_start
-        quote = _clean_evidence_quote(content, terms)
+        quote_terms = set(terms)
+        if re.search(r"复杂度|计算瓶颈|complexity", str(query or "").casefold()):
+            quote_terms.update({"complexity per layer", "maximum path length"})
+        quote = _clean_evidence_quote(content, quote_terms, prefer_metric=metric_bonus > 0)
         if not quote:
             continue
         span = {
             "source": source,
             "page_start": page_start,
             "page_end": page_end,
-            "section": _infer_section(content),
+            "section": section,
             "chunk_id": str(record.get("chunk_id") or record.get("_id") or ""),
             "quote": quote,
             "confidence": round(min(0.95, 0.45 + score / (score + 10) * 0.5), 3),
@@ -212,7 +426,11 @@ def load_relevant_evidence_spans(
     result = {}
     for source, spans in candidates.items():
         ranked = sorted(spans, key=lambda item: (item[0], item[1]), reverse=True)
-        result[source] = [span for _, _, span in ranked[:max(1, per_source)]]
+        result[source] = _select_diverse_evidence_spans(
+            ranked,
+            max(1, per_source),
+            broad_query=broad_query,
+        )
     return result
 
 

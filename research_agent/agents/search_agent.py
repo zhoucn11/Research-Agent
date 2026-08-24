@@ -157,7 +157,10 @@ async def search_map_node(state: AgentState):
             "这是服务或网络错误，不是关键词不匹配；禁止继续改写关键词重试，请直接向用户说明并建议检查代理/API 配置。"
         )
     elif not combined_results:
-        obs_msg = "联网服务正常，但未检索到有效文献；可再尝试一次更宽泛的上位概念，仍为空就如实说明。"
+        obs_msg = (
+            "联网服务正常，但本轮未检索到有效文献。请直接如实报告并停止本轮搜索；"
+            "如需放宽主题或年份，等待用户下一轮明确提出。"
+        )
     elif anchor_papers and not results:
         titles = [f"《{paper.title}》" for paper in anchor_papers]
         obs_msg = (
@@ -167,14 +170,9 @@ async def search_map_node(state: AgentState):
     else:
         titles = [f"《{p.title}》" for p in combined_results]
         obs_msg = (
-            f"🚨【检索结果反馈与自我反思指令】：\n"
-            f"本次检索共获取 {len(combined_results)} 篇文献：{', '.join(titles)}。\n\n"
-            f"【下一步行动指南】：\n"
-            f"1. 请严苛审查上述标题：它们是否**明确且同时包含**了用户要求的【所有核心细分概念】（例如既有'零样本'，又有'深海采矿'）？\n"
-            f"2. ❌ 如果缺失了关键的细分领域，说明本次搜索【未完美命中】！\n"
-            f"3. 🧗 面对未完美命中：下一轮 keyword 必须更短、更宽，或拆成单独概念轴；严禁添加更多修饰词、括号、OR/AND、斜杠组合。\n"
-            f"4. 示例：如果 `zero shot deep sea mining navigation` 未命中，下一轮用 `deep sea mining navigation`；再下一轮拆成 `underwater robot navigation` 或 `zero shot navigation`。\n"
-            f"5. 🛡️ 只有当你已经努力检索了 2 到 3 次依然无果时，才允许向用户触发【强制请示】。严禁在未经用户同意的情况下，输出 [APPROVE_SYNTHESIS] 强行总结泛化文献！"
+            f"本轮联网检索共获得 {len(combined_results)} 篇可追踪文献：{', '.join(titles)}。"
+            "请直接使用当前排序结果回答、列出候选或进入证据门控；同一用户轮次禁止继续调用联网搜索。"
+            "若结果相关性不足，应明确说明缺口，等待用户下一轮调整条件。"
         )
 
     evidence_update = (
@@ -191,7 +189,7 @@ async def search_map_node(state: AgentState):
         "collected_evidence": compact_state_value(evidence_update),
         "pending_questions": (
             "等待 Assistant 基于联网结果与对比锚点生成回答。"
-            if combined_results else "等待 Assistant 判断是放宽一次关键词，还是报告联网服务异常。"
+            if combined_results else "等待 Assistant 直接报告无结果或联网服务异常。"
         ),
         "messages": [ToolMessage(tool_call_id=tool_call["id"], content=obs_msg)],
     }
